@@ -171,7 +171,7 @@ void midi_apply_settings(uint8_t midi_in_channel_0_omni_16, bool midi_clock_rece
   else
     MIDI.begin(s_in_channel);
   if (s_midi_thru)
-    MIDI.turnThruOn();
+    MIDI.turnThruOff();
   else
     MIDI.turnThruOff();
 }
