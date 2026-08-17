@@ -69,7 +69,8 @@
  */
 
 #include <Arduino.h>
-#include "../src/pins.h"
+//#include "../src/pins.h"
+#include "pins.h"
 
 // -----------------------------------------------------------------------------
 // SRAM configuration
