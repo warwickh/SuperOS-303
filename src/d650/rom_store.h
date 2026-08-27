@@ -92,6 +92,7 @@ struct RomRx {
   uint16_t got = 0;        // bit per received block
   uint32_t last_ms = 0;    // for the caller's stall timeout
 
+
   bool busy() const { return state >= 5; }  // past the shared F0 7D 03 03 header
   void reset() { state = 0; got = 0; }
 

@@ -3625,19 +3625,15 @@
 function romEncodeSyx(rom) {
   const BLOCK_COUNT = 16;
   const BLOCK_SIZE = ROM_SIZE / BLOCK_COUNT; // 128 bytes
-
   if (!(rom instanceof Uint8Array)) {
     rom = new Uint8Array(rom);
   }
-
   if (rom.length !== ROM_SIZE) {
     throw new Error(
-      `ROM must be exactly ${ROM_SIZE} bytes; received ${rom.length}`
+      'ROM must be exactly ' + ROM_SIZE + ' bytes; received ' + rom.length
     );
   }
-
   const out = [];
-
   for (let blk = 0; blk < BLOCK_COUNT; blk++) {
     // Data block header:
     // F0 7D 03 03 7E 03 <block number>
@@ -3650,26 +3646,20 @@ function romEncodeSyx(rom) {
       0x03,
       blk
     );
-
     let sum = 0;
     const blockOffset = blk * BLOCK_SIZE;
-
     for (let i = 0; i < BLOCK_SIZE; i++) {
       const b = rom[blockOffset + i];
-
       // Encode one 8-bit ROM byte as two MIDI-safe nibbles.
       out.push((b >> 4) & 0x0F);
       out.push(b & 0x0F);
-
       sum = (sum + b) & 0xFF;
     }
-
     // Checksum as two nibbles, followed by SysEx terminator.
     out.push((sum >> 4) & 0x0F);
     out.push(sum & 0x0F);
     out.push(0xF7);
   }
-
   // Existing end marker.
   out.push(
     0xF0,
@@ -3680,7 +3670,6 @@ function romEncodeSyx(rom) {
     0x00,
     0xF7
   );
-
   return new Uint8Array(out);
 }
 
