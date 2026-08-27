@@ -22,7 +22,10 @@
 #include <avr/wdt.h>
 #include "../combined.h"
 
-#define D650_ROM_SIZE 2048
+#define D650_ROM_SIZE       2048
+#define D650_ROM_BLOCKS     16
+#define D650_ROM_BLOCK_SIZE (D650_ROM_SIZE / D650_ROM_BLOCKS)
+#define D650_ROM_NIBBLES    (D650_ROM_BLOCK_SIZE * 2)
 
 static inline uint16_t rom_sum16(const uint8_t *p) {
   uint16_t s = 0;
@@ -86,7 +89,7 @@ struct RomRx {
   uint16_t nib = 0;        // nibbles consumed in the data run (0..2047)
   uint8_t  hi = 0;         // latched high nibble
   uint8_t  sum = 0;        // running mod-256 sum of decoded bytes
-  uint8_t  got = 0;        // bit per received block
+  uint16_t got = 0;        // bit per received block
   uint32_t last_ms = 0;    // for the caller's stall timeout
 
   bool busy() const { return state >= 5; }  // past the shared F0 7D 03 03 header
@@ -114,20 +117,34 @@ struct RomRx {
         if (b != 0x03) { state = 0; return ROMRX_ERROR; }
         state = 6; return ROMRX_NONE;
       case 6:                                      // block number
-        if (b > 1) { state = 0; return ROMRX_ERROR; }
+        if (b >= D650_ROM_BLOCKS) { state = 0; return ROMRX_ERROR; }
         blk = b; nib = 0; sum = 0; state = 7;
         return ROMRX_STARTED;                      // caller: buffer now dirty
-      case 7:                                      // 2048 data nibbles
-        if (b > 0x0F) { state = 0; return ROMRX_ERROR; }
+      case 7: {                                    // 256 data nibbles
+        if (b > 0x0F) {
+          state = 0;
+          return ROMRX_ERROR;
+        }
         if (nib & 1) {
-          const uint8_t by = (uint8_t)((hi << 4) | b);
-          buf[((uint16_t)blk << 10) | (nib >> 1)] = by;
+          const uint8_t by =
+            (uint8_t)((hi << 4) | b);
+          const uint16_t byteIndex =
+            ((uint16_t)blk * D650_ROM_BLOCK_SIZE) +
+            (nib >> 1);
+          if (byteIndex >= D650_ROM_SIZE) {
+            state = 0;
+            return ROMRX_ERROR;
+          }
+          buf[byteIndex] = by;
           sum = (uint8_t)(sum + by);
         } else {
           hi = b;
         }
-        if (++nib == 2 * 1024) state = 8;
+        if (++nib == D650_ROM_NIBBLES) {
+          state = 8;
+        }
         return ROMRX_NONE;
+      }
       case 8:                                      // checksum high nibble
         if (b > 0x0F) { state = 0; return ROMRX_ERROR; }
         hi = b; state = 9; return ROMRX_NONE;
@@ -138,15 +155,17 @@ struct RomRx {
       case 12:                                     // block terminator
         state = 0;
         if (b != 0xF7) return ROMRX_ERROR;
-        got |= (uint8_t)(1 << blk);
+        got |= (uint16_t)(1UL << blk);
         return ROMRX_BLOCK;
       case 10:                                     // end marker payload
         if (b != 0x00) { state = 0; return ROMRX_ERROR; }
         state = 11; return ROMRX_NONE;
       case 11: {                                   // end terminator
         state = 0;
-        if (b != 0xF7) return ROMRX_ERROR;
-        const bool ok = (got == 0x03);
+        if (b != 0xF7) {
+          return ROMRX_ERROR;
+        }
+        const bool ok = (got == uint16_t(0xFFFF));
         got = 0;
         return ok ? ROMRX_DONE : ROMRX_ERROR;
       }
