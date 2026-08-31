@@ -234,9 +234,27 @@ inline void PollInputs(PinState *inputs) {
   digitalWriteFast(PG3_PIN, LOW);
   delayMicroseconds(SWITCH_DELAY);
 
-  // read PA and PB pins while select pins are high
+  // read PA and PB pins while select pins are high.
+  // KEY_INJ folds g_key_inject (SysEx 0x4B, test-only) into the pushed bit so an
+  // injected key debounces exactly like a physical one. Compiled to nothing unless
+  // SUPEROS_KEY_INJECT is defined (shipping builds carry no bench code).
+  //
+  // TRI-STATE since claim-116. This used to be `|| g_key_inject[i]`, a plain OR,
+  // which could ASSERT an input but never RELEASE one. WRITE_MODE and TRACK_SEL
+  // are physical DIAL bits (pins.h:260-263), so from the dial's Pattern Write
+  // position an OR could only ever reach TrackWrite: Pattern Play and Track Play
+  // were unreachable headless, and with them the whole Keyboard Play, live
+  // transpose and Track Play sections of the G1 checklist.
+  //
+  // The encoding is backward compatible on purpose: 0 and 1 mean exactly what
+  // they meant before, so every existing tools/diag walk script keeps working.
+#ifdef SUPEROS_KEY_INJECT
+#define KEY_INJ(i, raw) key_inj_apply(i, (raw))
+#else
+#define KEY_INJ(i, raw) (raw)
+#endif
   for (uint8_t i = 0; i < 4; ++i) {
-    inputs[EXTRA_PIN_OFFSET + i].push(digitalReadFast(status_pins[i])); // PAx
+    inputs[EXTRA_PIN_OFFSET + i].push(KEY_INJ(EXTRA_PIN_OFFSET + i, digitalReadFast(status_pins[i]))); // PAx
   }
 
   // open each switched channel with select pin
@@ -245,9 +263,10 @@ inline void PollInputs(PinState *inputs) {
     delayMicroseconds(SWITCH_DELAY);
     for (uint8_t j = 0; j < 4; ++j) {
       // read pins
-      inputs[ 0 + i*4 + j].push(digitalReadFast(button_pins[j])); // PBx
-      inputs[16 + i*4 + j].push(digitalReadFast(status_pins[j])); // PAx
+      inputs[ 0 + i*4 + j].push(KEY_INJ( 0 + i*4 + j, digitalReadFast(button_pins[j]))); // PBx
+      inputs[16 + i*4 + j].push(KEY_INJ(16 + i*4 + j, digitalReadFast(status_pins[j]))); // PAx
     }
     digitalWriteFast(select_pin[i], HIGH); // PHx
   }
+#undef KEY_INJ
 }

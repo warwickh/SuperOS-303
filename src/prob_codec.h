@@ -18,6 +18,11 @@ inline uint8_t prob_region_index(uint8_t abs_slot) {
 static constexpr uint8_t PR_ARMED_OFF = 1;
 static constexpr uint8_t PR_UPDBL_OFF  = uint8_t(1 + MAX_STEPS / 8);
 static constexpr uint8_t PR_PAY_OFF    = uint8_t(1 + 2 * (MAX_STEPS / 8));
+// Ratchets used to trit-pack into a fixed tail here (b2 bits 2:1); they moved
+// into the pattern blob 2026-08-31 (Sequence::ratchet[]), so the prob region no
+// longer carries them and b2 holds only bit0 (up-double).
+static_assert(PR_PAY_OFF + 2 * PROB_SPARSE_MAX <= PROB_REGION,
+              "sparse probability payload overruns the region");
 
 inline void ReadProbAt(uint8_t abs_slot, uint8_t *dst192) {
   memset(dst192, 0, FB_PROB_LEN);
@@ -48,9 +53,9 @@ inline void WriteProbAt(uint8_t abs_slot, const uint8_t *src192) {
   uint8_t n = 0;
   for (uint8_t step = 0; step < MAX_STEPS; ++step) {
     const uint8_t k = uint8_t(step * 3);
-    if (!src192[k] && !src192[k + 1] && !src192[k + 2]) continue;
+    if (!src192[k] && !src192[k + 1] && !prob_up_double(src192[k + 2])) continue;
     armed[step >> 3] |= uint8_t(1u << (step & 7));
-    if (src192[k + 2]) updbl[step >> 3] |= uint8_t(1u << (step & 7));
+    if (prob_up_double(src192[k + 2])) updbl[step >> 3] |= uint8_t(1u << (step & 7));
     ++n;
   }
 

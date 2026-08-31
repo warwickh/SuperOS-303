@@ -169,6 +169,32 @@ enum InputIndex : uint8_t {
   EXTRA_PIN_OFFSET = RUN,
 };
 
+// Headless panel key injection (test/bench only, mirrors the d650 emulator's
+// 0x4B). SysEx 0x4B <idx> <0|1> sets an entry; PollInputs OR-s it into the bit it
+// pushes for that input, so an injected key flows through the exact same debounce
+// and rising/held/falling edge logic a physical key does. Lets the SuperOS panel be
+// walked over USB with no fingers (gate G1 / claim-017). Compiled out unless
+// SUPEROS_KEY_INJECT is defined: the shipping `combined` build is at its flash
+// ceiling (0x17300 arena base) and has no room for bench code. Built in env
+// `app-inject`. One definition across TUs via the C++17 inline var.
+#ifdef SUPEROS_KEY_INJECT
+// SysEx 0x4B headless key injection (test builds only, SUPEROS_KEY_INJECT).
+// TRI-STATE per entry, claim-116:
+//
+//     0  pass the real pin through   (the default, and the old "release")
+//     1  force PRESSED               (the old OR)
+//     2  force RELEASED
+//
+// 0 and 1 keep their pre-claim-116 meaning, so existing walk scripts are
+// unaffected. 2 is what makes the DIAL bits WRITE_MODE and TRACK_SEL settable
+// in both directions, and with them Pattern Play and Track Play.
+inline uint8_t g_key_inject[INPUT_COUNT] = {};
+inline bool key_inj_apply(uint8_t i, bool raw) {
+  const uint8_t f = g_key_inject[i];
+  return f ? (f == 1) : raw;
+}
+#endif
+
 
 // =============================================================================
 // Physical row/column pins for matrix scan (PH selects, PB buttons, PA status)

@@ -407,6 +407,9 @@
     .prob-sub { display: flex; gap: 0; }
     .prob-sub .p-char { flex: 1.2; height: 16px; font-size: 8px; }
     .prob-sub .p-lvl  { flex: 1; height: 16px; font-size: 8px; letter-spacing: 0; }
+    /* ratchet 3x blinks, echoing the panel's SLIDE LED (solid = 2x, blink = 3x) */
+    .prob-sub .p-rat3 { animation: ratblink 0.7s steps(2, start) infinite; }
+    @keyframes ratblink { 50% { opacity: 0.25; } }
     .is-note .f-btn { border-color: rgba(255,255,255,0.25); color: rgba(255,255,255,0.4); }
     .is-note .f-btn:hover:not(:disabled) { background: rgba(255,255,255,0.15); color: var(--white); }
     .is-note .f-btn.f-on { background: var(--white); border-color: var(--white); color: var(--black); }
@@ -507,6 +510,18 @@
     .ml-startbox { flex: 1 1 240px; min-width: 200px; }
     .ml-startbox input[type=range] { width: 100%; }
     .ml-hint { font-size: 10px; color: var(--gray-3); line-height: 1.5; flex: 1 1 100%; }
+    /* 303 MIDI Pattern Loader (one-step upload) */
+    .ml303-box { border: var(--rule-sm); background: var(--gray-1); padding: 12px; display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+    .ml303-dest { font-size: 11px; font-weight: 700; align-self: center; }
+    .ml303-status { font-size: 10px; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase; align-self: center; }
+    .ml303-status.ok { color: var(--black); }
+    .ml303-status.err { color: var(--red); }
+    .ml303-bar { flex-basis: 100%; height: 3px; background: var(--gray-2); overflow: hidden; display: none; }
+    .ml303-bar.busy { display: block; }
+    .ml303-bar::after { content: ""; display: block; height: 100%; width: 30%; background: var(--black); animation: ml303slide 0.8s linear infinite; }
+    @keyframes ml303slide { from { transform: translateX(-100%); } to { transform: translateX(430%); } }
+    .ml-adv summary { cursor: pointer; font-size: 9px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; color: var(--gray-4); padding: 6px 0; user-select: none; }
+    .ml-adv[open] summary { color: var(--black); }
     .ml-steps { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 10px; max-height: 320px; overflow-y: auto; border: var(--rule-sm); padding: 6px; }
     .ml-step { display: flex; flex-direction: column; gap: 2px; width: 64px; border: 1px solid var(--gray-1); padding: 4px; }
     .ml-step-num { font-size: 9px; font-weight: 900; color: var(--gray-3); font-family: var(--mono); }
@@ -642,6 +657,28 @@
         <input type="file" id="fileRom" accept=".bin,.syx" style="display:none" />
         <span id="romStatus" style="font-size:11px;font-weight:600;color:var(--gray-4)"
           title="File loaded into this converter (the chip in the MIDI strip shows what is installed on the device)">no file loaded</span>
+      </div>
+    </div>
+    <!-- v1.2b-only bench tools: hidden until the 0x21 config reply reports a
+         FRAM firmware ("-fram" in the version string), so the same editor
+         works against both CPU boards. -->
+    <div class="group v12b-only" style="display:none">
+      <span class="lbl">FRAM<br>(v1.2b)</span>
+      <div class="group-inner" style="gap:6px;flex-wrap:wrap">
+        <button class="btn" id="btnFramProbe"
+          title="Probe the CY15B104Q pattern-storage FRAM on the v1.2b CPU board: reads the chip ID and does a write/readback test (SysEx 0x30)">Probe FRAM</button>
+        <span id="framStatus" style="font-size:11px;font-weight:600;color:var(--gray-4)">not probed</span>
+      </div>
+    </div>
+    <div class="group v12b-only" style="display:none">
+      <span class="lbl">DIN TX<br>(v1.2b)</span>
+      <div class="group-inner" style="gap:6px;flex-wrap:wrap"
+        title="Bench-test the DIN MIDI OUT pin (PD3 through R7 to the jack Tip / DIN pin 5). Low/High/2 Hz park the pin as DC for a multimeter; Notes sends a C4 beacon out the DIN jack only, every 250 ms. Trigger over USB-C, meter or monitor the DIN side. Normal restores the UART. (SysEx 0x33)">
+        <button class="btn" id="btnDinTxNormal">Normal</button>
+        <button class="btn" id="btnDinTxLow">Low</button>
+        <button class="btn" id="btnDinTxHigh">High</button>
+        <button class="btn" id="btnDinTxToggle">2 Hz</button>
+        <button class="btn" id="btnDinTxNotes">Notes</button>
       </div>
     </div>
     <div class="group">
@@ -855,20 +892,34 @@
   <div class="config-panel">
     <div class="config-bar" id="midiLoadBar">
       <span class="config-bar-arrow">&#9658;</span>
-      <span class="config-bar-label">MIDI Loader</span>
+      <span class="config-bar-label">303 MIDI Pattern Loader</span>
       <span class="ml-count" id="midiLoadCount">No file</span>
     </div>
     <div class="config-body" id="midiLoadBody">
       <div class="config-inner" style="flex-direction:column;align-items:stretch;gap:10px">
-        <div class="ml-row">
+        <div class="ml303-box">
+          <button class="btn btn-primary" id="btnMidi303Upload">Upload 303 MIDI Pattern</button>
+          <input type="file" id="midiFileInput" accept=".mid,.midi,audio/midi,audio/x-midi" style="display:none" />
+          <div class="ml-field">
+            <label>Pattern length (steps)</label>
+            <input type="number" id="midiTransLen" min="1" max="32" value="16" disabled title="How many 16th steps the pattern is (1-32). Prefilled from the file; a DAW export can't tell trailing rests, so correct it and hit Load if needed." />
+          </div>
+          <button class="btn" id="btnMidiTranslate" disabled>Load</button>
+          <span class="ml303-dest" id="ml303dest"></span>
+          <span class="ml303-status" id="ml303status"></span>
+          <div class="ml303-bar" id="ml303bar"></div>
+          <span class="ml-hint" style="margin:0;flex-basis:100%">One step: pick the .mid from your DAW and it converts and pushes to the 303 &mdash; notes, rests, ties, slides (overlapping notes), accents (velocity &#8805; 100), max 32 steps, straight 16ths (no triplets). If your clip ends in rests, fix <b>Pattern length</b> and hit <b>Load</b>.</span>
+        </div>
+        <details class="ml-adv">
+        <summary>Advanced pitch tools (load pitches only, randomize from file, chord import)</summary>
+        <div class="ml-row" style="margin-top:8px">
           <div class="ml-field">
             <label>MIDI File</label>
-            <button class="btn btn-primary" id="btnMidiFile">Choose .mid file</button>
-            <input type="file" id="midiFileInput" accept=".mid,.midi,audio/midi,audio/x-midi" style="display:none" />
+            <button class="btn" id="btnMidiFile">Choose .mid file</button>
           </div>
           <div class="ml-field">
-            <label>Steps (max 32)</label>
-            <input type="number" id="midiLoadSteps" min="1" max="32" value="16" disabled />
+            <label>Notes to load (max 32)</label>
+            <input type="number" id="midiLoadSteps" min="1" max="32" value="16" disabled title="Pitch tools only: how many notes from the file are mapped, one per step" />
           </div>
           <div class="ml-field">
             <label>Min chord notes</label>
@@ -894,11 +945,12 @@
           <button class="btn" id="btnMidiShuffle" disabled>Shuffle current</button>
           <button class="btn btn-primary" id="btnMidiApply" disabled>Load pitches (keep time)</button>
           <button class="btn" id="btnMidiReplace" disabled>Replace pattern (set time)</button>
-          <span class="ml-hint">Notes play in file order; chords are split into separate steps low&#8594;high. <b>Start</b> + <b>Section size</b> define a window of the file around the start note. <b>Sequential</b> takes that window in order; <b>Randomize in section</b> picks randomly inside it; <b>Randomize (whole file)</b> ignores the section; <b>Shuffle current</b> reorders the notes already chosen. <b>Load pitches (keep time)</b> overwrites only the pitch stream and leaves your rhythm/length intact; <b>Replace pattern</b> rebuilds the whole pattern as one NOTE per step.</span>
+          <span class="ml-hint">Pitch tools ignore the file's rhythm and use only its notes, in file order (chords split low&#8594;high). <b>Start</b> + <b>Section size</b> define a window of the file around the start note. <b>Sequential</b> takes that window in order; <b>Randomize in section</b> picks randomly inside it; <b>Randomize (whole file)</b> ignores the section; <b>Shuffle current</b> reorders the notes already chosen. <b>Load pitches (keep time)</b> overwrites only the pitch stream and leaves your rhythm/length intact; <b>Replace pattern</b> rebuilds the whole pattern as one NOTE per step. For a 1:1 import of the file's rhythm, use <b>Upload 303 MIDI Pattern</b> above instead.</span>
         </div>
         <div class="ml-steps" id="midiStepList">
           <div class="ml-empty">Load a MIDI file to build a pattern from its notes.</div>
         </div>
+        </details>
       </div>
     </div>
   </div>
@@ -950,6 +1002,20 @@
           <select id="cfgMidiThru">
             <option value="0">Off</option>
             <option value="1">On (forward MIDI IN → OUT)</option>
+          </select>
+        </div>
+        <div class="config-field">
+          <label>SysEx Receive</label>
+          <select id="cfgSyxRx" title="Off: the 303 ignores incoming SysEx except config (0x20/0x22) and the bootloader jump (0x4A), so it can always be turned back on">
+            <option value="1">On</option>
+            <option value="0">Off</option>
+          </select>
+        </div>
+        <div class="config-field">
+          <label>SysEx Send</label>
+          <select id="cfgSyxTx" title="Off: the 303 sends no SysEx (editor telemetry, replies). The editor will lose sync while this is off">
+            <option value="1">On</option>
+            <option value="0">Off</option>
           </select>
         </div>
         <div class="config-field">
@@ -1051,6 +1117,7 @@
   //   byte  49      transpose
   //   byte  50      engine_select (round-tripped untouched)
   //   byte  51      length (1..32 normal, 1..24 triplet)
+  //   bytes 52..59  ratchet[8]   2-bit cells, 4 steps/byte (0=none, 2=2x, 3=3x)
   //
   // Pitches are NOT indexed by time step. Use noteIdx(blob, s) to map a time
   // step to its stream slot. Time edits never shift pitch[]; the stream
@@ -1066,8 +1133,20 @@
   var TRANSPOSE_OFF  = RES0_OFF + 9;
   var ENGINE_OFF     = TRANSPOSE_OFF + 1;
   var LEN_OFF        = ENGINE_OFF + 1;
-  var PATTERN_SIZE   = LEN_OFF + 1;    // 52
-  var PACKED_SIZE    = PATTERN_SIZE + Math.ceil(PATTERN_SIZE / 7); // 60
+  var RAT_OFF        = LEN_OFF + 1;    // ratchet[8], 2 bits/step (0=none,2=2x,3=3x)
+  var RAT_BYTES      = MAX_STEPS / 4;
+  var PATTERN_SIZE   = RAT_OFF + RAT_BYTES;    // 60
+  var PACKED_SIZE    = PATTERN_SIZE + Math.ceil(PATTERN_SIZE / 7); // 69
+  // Per-step ratchet accessors (mirror Sequence::ratchet_of/set_ratchet_of).
+  function patternRatchet(blob, step) {
+    var i = step & (MAX_STEPS - 1);
+    return (blob[RAT_OFF + (i >> 2)] >> ((i & 3) * 2)) & 0x03;
+  }
+  function setPatternRatchet(blob, step, count) {
+    var i = step & (MAX_STEPS - 1), sh = (i & 3) * 2;
+    blob[RAT_OFF + (i >> 2)] =
+        (blob[RAT_OFF + (i >> 2)] & ~(0x03 << sh)) | ((count & 0x03) << sh);
+  }
 
   // Variation-3 poly blob (matches firmware poly.h, chord-list model). A CHORD STREAM
   // (notes pack 4x6 bits = 3 bytes/chord, accent/slide per chord) plus an independent
@@ -1547,7 +1626,7 @@
   var polyStore = []; // [g][p] -> Uint8Array(POLY_BLOB_SIZE) or null (variation-3 poly data)
   var probStore = []; // [g][p] -> Uint8Array(128) per-step probability (var1, 2 bytes/step)
   var groups = []; // [4][16] -> reference into varStore[g][p][slotVar[g][p]]
-  var LS_KEY = 'superos303_groups_v11'; // bumped for the 32-step (52-byte blob) layout; old key dropped
+  var LS_KEY = 'superos303_groups_v12'; // bumped for ratchet-in-pattern (60-byte blob); old 52-byte data dropped
   var LS_SCALE_LOCK = 'superos303_scale_lock';
 
   // ── Scale definitions ──────────────────────────────────────────────
@@ -2076,7 +2155,18 @@
     var tBtn = document.getElementById('btnTriplet');
     if (tBtn) tBtn.classList.toggle('btn-primary', isTriplet(blob));
     setActiveDirection(getDirection(blob));
+    ml303UpdateDest();
   }
+
+  // Keep the MIDI-upload destination label in sync with the selected slot.
+  function ml303SlotName() {
+    return 'G' + (activeGroup + 1) + '·P' + ((activePat % 8) + 1) + (activePat < 8 ? 'A' : 'B');
+  }
+  function ml303UpdateDest() {
+    var el = document.getElementById('ml303dest');
+    if (el) el.innerHTML = 'writes to the selected pattern: <b>' + ml303SlotName() + '</b>';
+  }
+  ml303UpdateDest();
 
   function switchGroup(g) {
     syncBlob();
@@ -2219,11 +2309,21 @@
     recomputeDirty();
   }
 
+  /** v1.2b (FRAM) bench tools: shown only when the reported firmware version
+   *  says "-fram", so one editor serves both CPU boards. Non-FRAM firmware
+   *  ignores SysEx 0x30/0x33, so the buttons would only mislead there. */
+  function updateV12bUi() {
+    var isFram = /fram/i.test(hwVersion);
+    var els = document.querySelectorAll('.v12b-only');
+    for (var i = 0; i < els.length; i++) els[i].style.display = isFram ? '' : 'none';
+  }
+
   /** Update the known firmware mode ('superos' | 'd650' | 'unknown') and its UI. */
   function setDeviceMode(mode) {
     deviceMode = mode;
     if (mode !== 'unknown') fwSwitchPending = false; // device re-identified: reconnect done
     if (mode === 'unknown') hwVersion = '';
+    updateV12bUi();
     document.body.classList.toggle('mode-d650', mode === 'd650');
     var el = document.getElementById('fwModeStatus');
     el.textContent = 'Firmware: ' + (mode === 'superos' ? 'SuperOS' + (hwVersion ? ' v' + hwVersion : '')
@@ -2600,6 +2700,41 @@
         row.appendChild(lBtn);
         probRow.appendChild(row);
       });
+      // Ratchet row: off -> 2x -> 3x -> off, the same cycle as the panel's
+      // SLIDE-in-TIME-MODE gesture. Ratchet is PATTERN data now (blob ratchet[],
+      // 2 bits/step), not probability: it rides the pattern blob and the 0x28
+      // per-step message. The device fires ratchets only on plain detached NOTE
+      // steps: a slide (either end) or a tie suppresses them at playback.
+      (function(si) {
+        var rc = patternRatchet(blob, si);
+        var row = document.createElement('div');
+        row.className = 'prob-sub';
+        var cBtn = document.createElement('button');
+        cBtn.className = 'f-btn p-char' + (rc >= 2 ? ' f-on' : '');
+        cBtn.textContent = 'RAT';
+        var vBtn = document.createElement('button');
+        vBtn.className = 'f-btn p-lvl' +
+            (rc === 3 ? ' f-on p-rat3' : (rc === 2 ? ' f-on' : ''));
+        vBtn.textContent = rc >= 2 ? (rc + 'x') : '–';
+        cBtn.disabled = vBtn.disabled = !editable || !noteStep;
+        if (sl && rc >= 2)
+          cBtn.title = vBtn.title = 'This note slides: the device suppresses its ratchet at playback';
+        var cyc = function() {
+          var b = groups[activeGroup][patIdx];
+          if (!b) return;
+          var cur = patternRatchet(b, si);
+          var nxt = (cur === 0) ? 2 : (cur === 2) ? 3 : 0;
+          setPatternRatchet(b, si, nxt);
+          saveGroupsToLS();
+          sendRatchetStep(patIdx, si, nxt);
+          renderGrid();
+        };
+        cBtn.addEventListener('click', cyc);
+        vBtn.addEventListener('click', cyc);
+        row.appendChild(cBtn);
+        row.appendChild(vBtn);
+        probRow.appendChild(row);
+      })(s);
       card.appendChild(probRow);
 
       gridEl.appendChild(card);
@@ -3338,6 +3473,11 @@
     var msbs = ((b0 >> 7) & 1) | ((b1 >> 6) & 2) | ((b2 >> 5) & 4);
     sendSysex(new Uint8Array([0x7d, 0x2b, pat & 15, s & 0x3f, b0 & 0x7f, b1 & 0x7f, b2 & 0x7f, msbs]));
   }
+  // 0x28: one step's ratchet count (0/2/3). Ratchet is pattern data now.
+  function sendRatchetStep(pat, s, count) {
+    if (activeGroup !== hwGroup) return;
+    sendSysex(new Uint8Array([0x7d, 0x28, pat & 15, s & 0x3f, count & 0x03]));
+  }
   function sendProbTable(pat) {
     if (activeGroup !== hwGroup) return;
     var t = getProb(activeGroup, pat);
@@ -3452,7 +3592,13 @@
     var thru = parseInt(document.getElementById('cfgMidiThru').value, 10) & 1;
     var bri  = parseInt(document.getElementById('cfgLedBri').value,   10);
     if (!(ch >= 0 && ch <= 16)) ch = (hwMidiChannel >= 1 && hwMidiChannel <= 16) ? hwMidiChannel : 1;
-    sendCfgWrite(ch, clk | (thru << 1), currentDirection, bri, hwVar2Channel, hwVar3Channel);
+    sendCfgWrite(ch, clk | (thru << 1) | cfgSyxFlags(), currentDirection, bri, hwVar2Channel, hwVar3Channel);
+  }
+  // Wire bits 2/3 are DISABLED bits (so old editors, which send 0, leave SysEx on).
+  function cfgSyxFlags() {
+    var rx = parseInt(document.getElementById('cfgSyxRx').value, 10) & 1;
+    var tx = parseInt(document.getElementById('cfgSyxTx').value, 10) & 1;
+    return (rx ? 0 : 4) | (tx ? 0 : 8);
   }
 
   function sendStepUpdate(pat, step, pitchByte, timeNibble, varIdx) {
@@ -3734,6 +3880,26 @@
     if (deviceMode !== 'superos') sendSysex(new Uint8Array([0x7d, 0x40]));
   }, 2000);
 
+  // FRAM probe (v1.2b board): 0x30 request; the 0x31 reply updates #framStatus.
+  document.getElementById('btnFramProbe').addEventListener('click', function() {
+    if (!midiOut) { log('FRAM probe skipped: connect MIDI output first', 'log-err'); return; }
+    var el = document.getElementById('framStatus');
+    if (el) { el.textContent = 'probing...'; el.style.color = 'var(--gray-4)'; }
+    sendSysex(new Uint8Array([0x7d, 0x30]));
+  });
+
+  // DIN TX bench test (v1.2b board): 0x33 <mode>. Modes 1-3 park PD3 as DC for a
+  // multimeter (UART released); mode 4 sends a C4 beacon out the DIN UART only.
+  [['btnDinTxNormal', 0, 'normal UART'], ['btnDinTxLow', 1, 'pin LOW'],
+   ['btnDinTxHigh', 2, 'pin HIGH'], ['btnDinTxToggle', 3, '2 Hz toggle'],
+   ['btnDinTxNotes', 4, 'note beacon']].forEach(function(b) {
+    document.getElementById(b[0]).addEventListener('click', function() {
+      if (!midiOut) { log('DIN TX test skipped: connect MIDI output first', 'log-err'); return; }
+      sendSysex(new Uint8Array([0x7d, 0x33, b[1]]));
+      log('DIN TX test: ' + b[2], 'log-ack');
+    });
+  });
+
   // ── Error toast ───────────────────────────────────────────────────
   var errorToastTimer = null;
   function showErrorToast(msg) {
@@ -3760,6 +3926,25 @@
 
     if (cmd === 0x37 && bytes.length >= 3) { // D650C mask-ROM status
       updateDevRom(bytes[2]);
+      return;
+    }
+
+    if (cmd === 0x31) { // FRAM probe reply: packed [id[9], status_reg, rw_result]
+      var fr = unpack7(bytes.subarray(2), 11);
+      var el = document.getElementById('framStatus');
+      var idHex = '';
+      for (var fi = 0; fi < 9; fi++) idHex += (fr[fi] < 16 ? '0' : '') + fr[fi].toString(16).toUpperCase() + (fi < 8 ? ' ' : '');
+      var isCypress = fr[6] === 0xC2;
+      var dead = fr.every(function(b, i) { return i >= 9 || b === 0x00; }) ||
+                 fr.every(function(b, i) { return i >= 9 || b === 0xFF; });
+      var ok = isCypress && fr[10] === 0;
+      if (el) {
+        el.textContent = dead ? 'bus dead (no reply from chip)' :
+                         ok   ? 'OK: CY15B104Q, write/readback pass' :
+                                'ID ' + idHex + ', rw=' + (fr[10] === 0 ? 'pass' : 'FAIL');
+        el.style.color = ok ? 'var(--green, #3a3)' : 'var(--red, #c33)';
+      }
+      log('FRAM probe: id=[' + idHex + '] sr=0x' + fr[9].toString(16) + ' rw=' + (fr[10] === 0 ? 'pass' : 'fail'), ok ? 'log-ack' : 'log-err');
       return;
     }
 
@@ -3930,6 +4115,12 @@
       var names = ['ok','bad_checksum','bad_pattern','blocked_clock'];
       var st = bytes[2];
       log('ACK: ' + (names[st] || 'status=' + st), st === 0 ? 'log-ack' : 'log-err');
+      if (ml303AckPending) {
+        ml303AckPending = false;
+        if (ml303AckTimer) clearTimeout(ml303AckTimer);
+        if (st === 0) ml303SetStatus('Uploaded to ' + ml303SlotName() + ' ✔', 'ok', false);
+        else ml303SetStatus('Upload failed: ' + (names[st] || st), 'err', false);
+      }
       if (saveAckPending && st === 0) {
         saveAckPending = false;
         commitIdx[activeGroup][activePat] = histIdx[activeGroup][activePat];
@@ -4150,7 +4341,7 @@
       return;
     }
 
-    if (cmd === 0x2b && bytes.length >= 7) { // one probability step from hardware (3 bytes)
+    if (cmd === 0x2b && bytes.length >= 7) { // one probability step from hardware (3 bytes + optional MSB byte)
       var psPat = bytes[2] & 0x0f, psStep = bytes[3] & 0x3f;
       var psG = (hwGroup >= 0) ? hwGroup : activeGroup;
       var pt = getProb(psG, psPat);
@@ -4161,6 +4352,20 @@
       saveGroupsToLS();
       if (activeGroup === psG && psPat === activePat) renderGrid();
       log('Prob step pat ' + (psPat+1) + ' step ' + (psStep+1), 'log-ack');
+      return;
+    }
+
+    if (cmd === 0x28 && bytes.length >= 5) { // one ratchet step from hardware (pattern data)
+      var rsPat = bytes[2] & 0x0f, rsStep = bytes[3] & 0x3f, rsCount = bytes[4] & 0x03;
+      var rsG = (hwGroup >= 0) ? hwGroup : activeGroup;
+      var rb = groups[rsG][rsPat];
+      if (rb) {
+        setPatternRatchet(rb, rsStep, rsCount);
+        saveGroupsToLS();
+        if (activeGroup === rsG && rsPat === activePat) renderGrid();
+        log('Ratchet pat ' + (rsPat+1) + ' step ' + (rsStep+1) + ' = ' +
+            (rsCount >= 2 ? rsCount + 'x' : 'off'), 'log-ack');
+      }
       return;
     }
 
@@ -4291,6 +4496,8 @@
       document.getElementById('cfgMidiCh').value   = String(ch);
       document.getElementById('cfgMidiClk').value  = String(fl & 1);
       document.getElementById('cfgMidiThru').value = String((fl >> 1) & 1);
+      document.getElementById('cfgSyxRx').value    = String((fl & 4) ? 0 : 1);
+      document.getElementById('cfgSyxTx').value    = String((fl & 8) ? 0 : 1);
       // Byte 4 (legacy global direction) is ignored — direction is per-pattern in v0.6.
       var briStr = '';
       if (bytes.length >= 6) {
@@ -4881,9 +5088,20 @@
   // a no-op so the many call sites in the randomize/nudge/poly handlers are inert.
   function syncScaleSnapAndApply(_g, _p, _len) {}
 
+  /** Pitch-family randomizers iterate over NOTE slots, so on a cleared pattern
+   *  (all RESTs, e.g. right after CLEAR on the 303) they had nothing to write
+   *  and silently did nothing. Seed random time first so they always produce
+   *  audible steps. Returns true if time was generated. */
+  function ensureTimeSteps(blob, len) {
+    if (noteCount(blob, len) !== 0) return false;
+    applyRandomTime(blob, len);
+    return true;
+  }
+
   document.getElementById('btnRandPitch').onclick = function() {
     if (curIsPoly()) { polyRandomizeOp('pitch'); return; }
     var blob = activeBlob(), len = currentPatLen();
+    ensureTimeSteps(blob, len);
     applyRandomPitches(blob, len);
     syncScaleSnapAndApply(activeGroup, activePat, len);
     pushHistory(activeGroup, activePat); saveGroupsToLS(); renderGrid(); recomputeDirty();
@@ -4893,6 +5111,7 @@
   document.getElementById('btnRandOctave').onclick = function() {
     if (curIsPoly()) { polyRandomizeOp('octave'); return; }
     var blob = activeBlob(), len = currentPatLen();
+    ensureTimeSteps(blob, len);
     applyRandomOctave(blob, len);
     syncScaleSnapAndApply(activeGroup, activePat, len);
     pushHistory(activeGroup, activePat); saveGroupsToLS(); renderGrid(); recomputeDirty();
@@ -4910,6 +5129,7 @@
   document.getElementById('btnRandAccent').onclick = function() {
     if (curIsPoly()) { polyRandomizeOp('accent'); return; }
     var blob = activeBlob(), len = currentPatLen();
+    ensureTimeSteps(blob, len);
     applyRandomAccent(blob, len);
     pushHistory(activeGroup, activePat); saveGroupsToLS(); renderGrid(); recomputeDirty();
     pushFullPatternNow();
@@ -4918,6 +5138,7 @@
   document.getElementById('btnRandSlide').onclick = function() {
     if (curIsPoly()) { polyRandomizeOp('slide'); return; }
     var blob = activeBlob(), len = currentPatLen();
+    ensureTimeSteps(blob, len);
     applyRandomSlide(blob, len);
     pushHistory(activeGroup, activePat); saveGroupsToLS(); renderGrid(); recomputeDirty();
     pushFullPatternNow();
@@ -4958,6 +5179,7 @@
   document.getElementById('btnRandBrownian').onclick = function() {
     if (curIsPoly()) { polyRandomizeOp('brownian'); return; }
     var blob = activeBlob(), len = currentPatLen();
+    ensureTimeSteps(blob, len);
     applyBrownianPitches(blob, len);
     syncScaleSnapAndApply(activeGroup, activePat, len);
     pushHistory(activeGroup, activePat); saveGroupsToLS(); renderGrid(); recomputeDirty();
@@ -5408,9 +5630,11 @@
     var clk  = parseInt(document.getElementById('cfgMidiClk').value,  10);
     var thru = parseInt(document.getElementById('cfgMidiThru').value, 10);
     var bri  = parseInt(document.getElementById('cfgLedBri').value,   10);
-    var fl   = (clk & 1) | ((thru & 1) << 1);
+    var fl   = (clk & 1) | ((thru & 1) << 1) | cfgSyxFlags();
     sendCfgWrite(ch, fl, currentDirection, bri);
-    log('\u2190 Set config: ch=' + ch + ' clock_rx=' + clk + ' thru=' + thru + ' dir=' + (kDirNames[currentDirection] || currentDirection) + ' bri=' + bri, 'log-syx');
+    var syxRx = (fl & 4) ? 0 : 1, syxTx = (fl & 8) ? 0 : 1;
+    log('\u2190 Set config: ch=' + ch + ' clock_rx=' + clk + ' thru=' + thru + ' syx_rx=' + syxRx + ' syx_tx=' + syxTx + ' dir=' + (kDirNames[currentDirection] || currentDirection) + ' bri=' + bri, 'log-syx');
+    if (!syxTx) log('SysEx Send is now OFF on the 303: no ack/echo will come back and the editor cannot sync until it is re-enabled (Write with Send=On, or F# in the config menu on the panel).', 'log-err');
   };
 
   // Direction buttons \u2014 per-pattern (writes reserved[0] bits[2:0])
@@ -6036,6 +6260,7 @@
   var midiStepSrc = [];   // per-step pool index
   var midiChordMode = false; // true when the active variation is poly var3 at load time
   var midiClustersRaw = null; // chord clusters from the last chord-mode load (pre-filter)
+  var midiRawBuf = null;  // raw ArrayBuffer of the last loaded file (for Translate)
 
   /** Fold a MIDI note number into the device's linear 0..48 range (MIDI 36 = lin 0). */
   function midiToLinear(m) {
@@ -6093,6 +6318,66 @@
   /** Flat play-ordered note numbers (chords split low->high). */
   function parseMidiNotes(buf) {
     return parseMidiEvents(buf).map(function(e) { return e.note; });
+  }
+  /**
+   * Full timed parse for Translate: note intervals with velocity.
+   * Returns { div, notes: [{ on, off, note, vel }] } sorted by onset tick.
+   * Overlapping same-pitch notes pair off in LIFO order (matches how a live
+   * overdub reads back); an unterminated note ends at the track's last tick.
+   */
+  function parseMidiTimedNotes(buf) {
+    var b = new Uint8Array(buf);
+    if (b.length < 14 || b[0] !== 0x4d || b[1] !== 0x54 || b[2] !== 0x68 || b[3] !== 0x64)
+      throw new Error('Not a Standard MIDI File (no MThd header)');
+    var headerLen = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7];
+    var ntrks = (b[10] << 8) | b[11];
+    var pos = 8 + headerLen, notes = [], open = {}, lastTick = 0, timeSig = null;
+    for (var tr = 0; tr < ntrks && pos + 8 <= b.length; tr++) {
+      var chunkLen = (b[pos+4] << 24) | (b[pos+5] << 16) | (b[pos+6] << 8) | b[pos+7];
+      if (!(b[pos] === 0x4d && b[pos+1] === 0x54 && b[pos+2] === 0x72 && b[pos+3] === 0x6b)) {
+        pos += 8 + chunkLen; continue;
+      }
+      pos += 8;
+      var end = Math.min(pos + chunkLen, b.length), tick = 0, status = 0, c;
+      while (pos < end) {
+        var dt = 0;
+        do { c = b[pos++]; dt = (dt << 7) | (c & 0x7f); } while ((c & 0x80) && pos < end);
+        tick += dt;
+        if (tick > lastTick) lastTick = tick;
+        if (pos >= end) break;
+        if (b[pos] & 0x80) status = b[pos++];
+        var hi = status & 0xf0;
+        if (status === 0xff) {
+          var mt = b[pos++]; var ml = 0;
+          do { c = b[pos++]; ml = (ml << 7) | (c & 0x7f); } while ((c & 0x80) && pos < end);
+          if (mt === 0x58 && ml >= 2 && !timeSig)
+            timeSig = { num: b[pos], den: 1 << b[pos + 1] }; // first time signature wins
+          pos += ml;
+        } else if (status === 0xf0 || status === 0xf7) {
+          var sl = 0;
+          do { c = b[pos++]; sl = (sl << 7) | (c & 0x7f); } while ((c & 0x80) && pos < end);
+          pos += sl;
+        } else if (hi === 0x90 || hi === 0x80) {
+          var note = b[pos++], vel = b[pos++];
+          if (hi === 0x90 && vel > 0) {
+            (open[note] = open[note] || []).push({ on: tick, off: -1, note: note, vel: vel });
+            notes.push(open[note][open[note].length - 1]);
+          } else {
+            var st = open[note];
+            if (st && st.length) st.pop().off = tick;
+          }
+        } else if (hi === 0xa0 || hi === 0xb0 || hi === 0xe0) {
+          pos += 2;
+        } else if (hi === 0xc0 || hi === 0xd0) {
+          pos += 1;
+        } else break;
+      }
+      pos = end;
+    }
+    for (var i = 0; i < notes.length; i++)
+      if (notes[i].off < 0) notes[i].off = Math.max(notes[i].on + 1, lastTick);
+    notes.sort(function(a, b2) { return a.on - b2.on || a.note - b2.note; });
+    return { div: midiDivision(buf), notes: notes, timeSig: timeSig };
   }
   /** Ticks per quarter note (used to size the chord-onset window). SMPTE -> small. */
   function midiDivision(buf) {
@@ -6257,7 +6542,7 @@
   function midiUpdateControls() {
     var has = midiPool.length > 0;
     ['midiLoadSteps','midiLoadStart','midiLoadRange','btnMidiSeq','btnMidiRandAll',
-     'btnMidiRandRange','btnMidiShuffle','btnMidiApply','btnMidiReplace'].forEach(function(id) {
+     'btnMidiRandRange','btnMidiShuffle','btnMidiApply','btnMidiReplace','btnMidiTranslate','midiTransLen'].forEach(function(id) {
       document.getElementById(id).disabled = !has;
     });
     document.getElementById('midiLoadCount').textContent =
@@ -6275,6 +6560,14 @@
   });
 
   document.getElementById('btnMidiFile').onclick = function() {
+    midiUploadAuto = false; // advanced path: load the pool only, no auto-apply
+    document.getElementById('midiFileInput').click();
+  };
+  // One-step 303 upload: choose the file, then auto-translate + push into the
+  // selected pattern as soon as it loads.
+  var midiUploadAuto = false;
+  document.getElementById('btnMidi303Upload').onclick = function() {
+    midiUploadAuto = true;
     document.getElementById('midiFileInput').click();
   };
   // Reset the selection controls to match the freshly built pool and render.
@@ -6312,8 +6605,16 @@
           midiPool = notes.map(function(m) { var l = midiToLinear(m); return { lin: l, label: noteNameFromLinear(l) }; });
         }
         midiName = file.name;
+        midiRawBuf = e.target.result;
+        // Prefill the Translate length from the file so the user confirms or
+        // corrects it instead of the editor guessing at apply time.
+        try {
+          var tm = midiTranslateModel(parseMidiTimedNotes(midiRawBuf));
+          if (tm) document.getElementById('midiTransLen').value = String(tm.len);
+        } catch (e2) { /* not translatable; Translate will report it */ }
         midiAfterPoolBuilt();
         log('MIDI loaded: ' + midiName + ' (' + midiPool.length + (midiChordMode ? ' chords, chord mode)' : ' notes)'), 'log-syx');
+        if (midiUploadAuto) midiTranslateFile();
       } catch (err) {
         alert('MIDI load error: ' + err.message);
         log('MIDI load error: ' + err.message, 'log-err');
@@ -6422,6 +6723,130 @@
   }
   document.getElementById('btnMidiApply').onclick   = function() { midiApplyToPattern(true); };
   document.getElementById('btnMidiReplace').onclick = function() { midiApplyToPattern(false); };
+
+  /**
+   * Translate the loaded file's own rhythm into a 303 pattern (mono, straight
+   * 16ths). One 16th = division/4 ticks. Per note interval:
+   *   - onset quantized to the nearest 16th step (first MAX_STEPS steps kept);
+   *   - duration past the onset step becomes TIEs;
+   *   - a next onset before this note's off = legato = slide flag on THIS
+   *     (source) note, and its ties stop at the next onset (303 slide model);
+   *   - velocity >= 100 = accent;
+   *   - pitch folded octave-wise into linear 0..48 (nearest octave in range).
+   * Simultaneous onsets on one step keep the lowest note (bass line).
+   * Returns { time: [MAX_STEPS], pitches: [packed...], len } or null when the
+   * file has no notes inside the window.
+   */
+  function midiTranslateModel(parsed) {
+    var stepTicks = parsed.div / 4;
+    var kept = [], usedStep = {};
+    for (var i = 0; i < parsed.notes.length; i++) {
+      var nt = parsed.notes[i];
+      var st = Math.round(nt.on / stepTicks);
+      if (st >= MAX_STEPS) break;
+      if (usedStep[st] !== undefined) {
+        // chord: keep the lowest note on the step
+        if (nt.note < kept[usedStep[st]].note) kept[usedStep[st]] = { step: st, on: nt.on, off: nt.off, note: nt.note, vel: nt.vel };
+        continue;
+      }
+      usedStep[st] = kept.length;
+      kept.push({ step: st, on: nt.on, off: nt.off, note: nt.note, vel: nt.vel });
+    }
+    if (kept.length === 0) return null;
+    kept.sort(function(a, b) { return a.step - b.step; });
+    var time = new Array(MAX_STEPS); for (var t = 0; t < MAX_STEPS; t++) time[t] = 0;
+    var pitches = [], lastUsed = 0;
+    for (var k = 0; k < kept.length; k++) {
+      var n = kept[k], next = kept[k + 1] || null;
+      var slide = !!(next && next.on < n.off);
+      var endStep = Math.round(n.off / stepTicks);
+      if (slide) endStep = Math.min(endStep, next.step); // ties run into the destination
+      if (endStep <= n.step) endStep = n.step + 1;
+      if (endStep > MAX_STEPS) endStep = MAX_STEPS;
+      time[n.step] = 1; // NOTE
+      for (var s = n.step + 1; s < endStep; s++) {
+        if (next && s >= next.step) break;
+        time[s] = 2; // TIE
+        if (s + 1 > lastUsed) lastUsed = s + 1;
+      }
+      if (n.step + 1 > lastUsed) lastUsed = n.step + 1;
+      var packed = linearToPacked(midiToLinear(n.note));
+      if (n.vel >= 100) packed |= 0x40; // accent
+      if (slide)        packed |= 0x80; // slide (stored on the source note)
+      pitches.push(packed);
+    }
+    // Round the length up to the file's bar boundary: a DAW export often ends
+    // the track at the last note-off, so trailing rest steps carry no events.
+    // 4/4 -> 16 steps/bar, 3/4 -> 12, etc. Missing/odd time signature -> 16.
+    var stepsPerBar = 16;
+    if (parsed.timeSig && parsed.timeSig.den > 0) {
+      var spb = Math.round(parsed.timeSig.num * 16 / parsed.timeSig.den);
+      if (spb >= 1 && spb <= MAX_STEPS) stepsPerBar = spb;
+    }
+    var len = Math.ceil(lastUsed / stepsPerBar) * stepsPerBar;
+    return { time: time, pitches: pitches, len: Math.max(1, Math.min(MAX_STEPS, len)) };
+  }
+  function midiTranslateFile() {
+    if (!midiRawBuf) return;
+    if (slotVar[activeGroup][activePat] === 2 && isVar3Poly(activeGroup, activePat)) {
+      alert('Translate writes a mono pattern. Switch the active slot off variation-3 chord mode first.');
+      return;
+    }
+    var model;
+    try { model = midiTranslateModel(parseMidiTimedNotes(midiRawBuf)); }
+    catch (err) { alert('MIDI translate error: ' + err.message); return; }
+    if (!model) { alert('No notes found in the first ' + MAX_STEPS + ' 16th steps of the file.'); return; }
+    var blob = activeBlob();
+    for (var k = 0; k < MAX_STEPS; k++) blob[k] = PITCH_EMPTY;
+    for (var t = 0; t < TIME_BYTES; t++) blob[TIME_OFF + t] = 0;
+    for (var s = 0; s < MAX_STEPS; s++) setTime(blob, s, model.time[s]);
+    for (var p = 0; p < model.pitches.length; p++) blob[p] = model.pitches[p];
+    setTriplet(blob, false); // translation assumes straight 16ths
+    // The user-entered length wins over the file-derived one (a DAW export
+    // carries no events for trailing rests, so only the user knows for sure).
+    var userLen = Number(document.getElementById('midiTransLen').value) | 0;
+    var len = (userLen >= 1 && userLen <= MAX_STEPS) ? userLen : model.len;
+    setLength(blob, len);
+    syncScaleSnapAndApply(activeGroup, activePat, len);
+    var nSlides = 0, nAcc = 0, nTies = 0;
+    for (var q = 0; q < model.pitches.length; q++) {
+      if (model.pitches[q] & 0x80) nSlides++;
+      if (model.pitches[q] & 0x40) nAcc++;
+    }
+    for (var u = 0; u < len; u++) if (model.time[u] === 2) nTies++;
+    log('MIDI translate: ' + model.pitches.length + ' notes, ' + nTies + ' ties, ' +
+        nSlides + ' slides, ' + nAcc + ' accents, length ' + len +
+        (len !== model.len ? ' (user; file suggested ' + model.len + ')' : '') +
+        ' from ' + (midiName || 'file'), 'log-ack');
+    syncPatternToolbar();
+    pushHistory(activeGroup, activePat);
+    saveGroupsToLS();
+    renderGrid();
+    recomputeDirty();
+    // Upload feedback: busy bar while the 0x12 is in flight, resolved by the
+    // device's 0x14 ack (see the 0x14 handler) or a 2.5 s timeout.
+    if (!midiOut) {
+      ml303SetStatus('Saved in editor only — 303 not connected', 'err', false);
+    } else if (hwGroup >= 0 && activeGroup !== hwGroup) {
+      ml303SetStatus('Not pushed — editor group differs from device group', 'err', false);
+    } else {
+      ml303AckPending = true;
+      ml303SetStatus('Uploading to 303…', '', true);
+      if (ml303AckTimer) clearTimeout(ml303AckTimer);
+      ml303AckTimer = setTimeout(function() {
+        if (ml303AckPending) { ml303AckPending = false; ml303SetStatus('No reply from 303', 'err', false); }
+      }, 2500);
+    }
+    pushFullPatternNow();
+  }
+  var ml303AckPending = false, ml303AckTimer = null;
+  function ml303SetStatus(txt, cls, busy) {
+    var el = document.getElementById('ml303status');
+    if (el) { el.textContent = txt; el.className = 'ml303-status' + (cls ? ' ' + cls : ''); }
+    var bar = document.getElementById('ml303bar');
+    if (bar) bar.classList.toggle('busy', !!busy);
+  }
+  document.getElementById('btnMidiTranslate').onclick = midiTranslateFile;
   document.getElementById('midiLoadBar').addEventListener('click', function() {
     var body = document.getElementById('midiLoadBody');
     var open = body.classList.toggle('is-open');

@@ -16,37 +16,44 @@
 // All arena pages are in RWW (below the 0x1E000 NRWW edge). Page 0 is the arena
 // header; every other page holds exactly one record.
 //
-// Combined build: the SuperOS+D650C image is ~92 KB, so the arena starts at
-// 0x17200 (pages 0x172..0x1DF, 110 pages -> 109 record pages, 108 distinct
+// Combined build: the SuperOS+D650C image is ~93 KB, so the arena starts at
+// 0x17300 (pages 0x173..0x1DF, 109 pages -> 108 record pages, 107 distinct
 // blocks after the update reserve -- the worst-case live set of 107 records
-// plus the reserve fits EXACTLY, see the static_assert in flash_persist.h;
-// the arena cannot move up again without shrinking that set). Only a few
+// fits EXACTLY, see the static_assert in flash_persist.h; the arena cannot
+// move up again without shrinking that set). Only a few
 // hundred bytes of app headroom are left below it, so watch makesyx's ceiling
 // check when adding code. The SPM service accepts pages
 // 0x100..0x1DF, so no service reflash is needed. Keep FLASH_ARENA_BASE in
 // tools/makesyx.py in sync. First boot of a different layout finds no valid
 // header at its base and formats (stored patterns are wiped on a layout change).
-// History: 0x15800 -> 0x16000 -> 0x18000 -> 0x17000 -> 0x17200. The arena CANNOT grow downward past
+// History: 0x15800 -> 0x16000 -> 0x18000 -> 0x17000 -> 0x17200 -> 0x17300 -> 0x17500. The arena CANNOT grow downward past
 // the app: 0x1E000 is the NRWW boundary and the SPM service refuses pages above
 // 0x1DF, so every KB of app code is paid for out of the record budget.
 #ifdef SUPEROS_COMBINED
-static constexpr uint16_t FE_ARENA_FIRST_PAGE = 0x172;
-static constexpr uint16_t FE_BANK_PAGES       = 55;           // half the arena (kept for sizing)
+// Moved 0x173 -> 0x175 (2026-08-31): moving the per-step ratchet into the
+// pattern blob grew the serialize/codec/permutation code ~230 B past 0x17300.
+// The worst-case-fits guarantee was deliberately given up for the ratchet-in-
+// pattern change (accepted: nobody fills every slot AND every step), so the two
+// record pages this costs are an accepted trade for the app headroom.
+static constexpr uint16_t FE_ARENA_FIRST_PAGE = 0x175;
+// 107 pages (0x175..0x1DF): 106 record pages, 105 usable after the update
+// reserve. Below the 107-record theoretical worst case (see flash_persist.h).
+static constexpr uint16_t FE_ARENA_PAGES_OVERRIDE = 107;
 #else
 // SuperOS-only build: moved from 0x10000 (112/bank) to 0x12000 for the same
 // reason as the combined image above -- the pattern-write spec pushed the app
 // past 64 KB. 95 records per bank still comfortably exceeds what one device
 // writes in practice.
 static constexpr uint16_t FE_ARENA_FIRST_PAGE = 0x120;
-static constexpr uint16_t FE_BANK_PAGES       = 96;           // pages per bank (2 banks)
+static constexpr uint16_t FE_ARENA_PAGES_OVERRIDE = 2 * 96; // pages per bank (2 banks)
 #endif
 // SINGLE arena: every page below page 0 (the header) holds one live record.
 // The old layout split this into two banks and kept one of them empty purely
 // as a landing zone for whole-bank GC, which cost half the capacity. AVR erases
 // ONE page at a time (see flash_service.c), so a superseded record's page can
 // be reclaimed on its own and the spare bank is unnecessary. Capacity roughly
-// doubles: 110 live records combined, 190 SuperOS-only.
-static constexpr uint16_t FE_ARENA_PAGES      = 2 * FE_BANK_PAGES;
+// doubles: 108 record pages combined, 191 SuperOS-only.
+static constexpr uint16_t FE_ARENA_PAGES      = FE_ARENA_PAGES_OVERRIDE;
 static constexpr uint16_t FE_RECORD_PAGES     = FE_ARENA_PAGES - 1; // page 0 = header
 static constexpr uint16_t FE_PAGE             = 256;
 
@@ -61,7 +68,7 @@ static constexpr uint16_t FE_PAGE             = 256;
 //
 // At 32 steps the dense overflow ids are UNREACHABLE (a full pattern always
 // fits its sparse region), so the worst-case live set is 48 + 32 + 22 + 4 + 1
-// = 107 records -- guaranteed to fit the 110-block combined arena with every
+// = 107 records -- guaranteed to fit the 108-record combined arena with every
 // slot fully armed. The overflow id ranges are kept only so the map layout
 // stays uniform.
 static constexpr uint16_t FE_MAX_BLOCKS = 427;

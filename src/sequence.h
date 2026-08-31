@@ -15,7 +15,20 @@
 //   reserved[9]          -- reserved[0] = direction (bits[2:0]) + triplet flag (bit 3)
 //                           reserved[1] = scale mask low 8 bits
 //                           reserved[2] = scale enabled (bit 7) + mask high 4 bits
-//                           reserved[3..8] = free padding.
+//                           reserved[3] = bit 0 is the A/B section link, stored
+//                             on the A section only (AB_LINK_FLAG, below).
+//                           reserved[4..6] = stored chain: [4] bits[2:0] = length,
+//                             [5]/[6] = four 4-bit slot entries (main.cpp:299-301).
+//                           reserved[7..8] = the only genuinely free bytes. TWO,
+//                             not six. This comment used to read "reserved[3..8]
+//                             = free padding" and stopped being true when the
+//                             link flag and the stored chain took [3] and [4..6].
+//                             Sizing a new per-step field off the stale six is
+//                             how claim-062 nearly concluded that 2-bit ratchets
+//                             (8 B, so +6 net) do not fit: at +8 the
+//                             PAT_SPARSE_MAX assert in flash_persist.h fails.
+//                             Verify with `grep -rn "reserved\[[3-8]\]" src/`
+//                             before spending either byte.
 //   transpose            -- per-pattern transpose, signed int8 in the byte (-24..+24).
 //   engine_select        -- unused, kept 0.
 //   length               -- 1..32 (triplet mode caps at 24).
@@ -68,7 +81,9 @@ static constexpr int NUM_GROUPS = NUM_BANKS; // back-compat alias
 // CV/gate plays. 64 slots x 3 = 192 patterns total.
 static constexpr int NUM_VARIATIONS = 3;
 static constexpr int NUM_SLOTS = NUM_PATTERNS * NUM_BANKS; // 64
-// reserved[9] (direction + unused padding) + transpose + engine_select + length
+// reserved[9] (direction, scale, A/B link, stored chain, 2 free) + transpose +
+// engine_select + length. Only reserved[7..8] are free; see the layout comment
+// at the top of this file before spending them.
 static constexpr int METADATA_SIZE = 12;
 
 enum SequencerMode {
@@ -125,6 +140,14 @@ static inline uint8_t prob_slide_level(uint8_t b0)  { return (b0 >> 4) & 0x0F; }
 static inline uint8_t prob_down_level(uint8_t b1)   { return b1 & 0x0F; }
 static inline uint8_t prob_up_level(uint8_t b1)     { return (b1 >> 4) & 0x0F; }
 static inline bool    prob_up_double(uint8_t b2)    { return (b2 & 0x01) != 0; }
+// Ratchet count in b2 bits [2:1]: 0 = none, 2 = 2x, 3 = 3x (1 is unused and
+// reads as none). Rides the probability table so it inherits the resident
+// load/flush, the claim-073 permutation carry, and the 0x2B/0x2D wire (which
+// send b2 verbatim) with no new storage records or opcodes.
+static inline uint8_t prob_ratchet(uint8_t b2)      { return uint8_t((b2 >> 1) & 0x03); }
+static inline uint8_t prob_pack_ratchet(uint8_t b2, uint8_t count) {
+  return uint8_t((b2 & ~0x06u) | (uint8_t(count & 0x03u) << 1));
+}
 static inline uint8_t prob_pack_ac_sl(uint8_t acc_lvl, uint8_t sld_lvl) {
   return uint8_t((acc_lvl & 0x0F) | ((sld_lvl & 0x0F) << 4));
 }
@@ -159,6 +182,11 @@ struct Sequence {
   uint8_t transpose     = 0;
   uint8_t engine_select = 0;
   uint8_t length        = 16;
+  // Per-step ratchet count, 2 bits/step (4 steps/byte), stored 0=none, 2=2x,
+  // 3=3x (value 1 unused). Persisted WITH the pattern (moved out of the
+  // probability table 2026-08-31 so a ratchet is pattern data, not prob data);
+  // permutes with time_data (sequence_rotate/reverse_ratchet).
+  uint8_t ratchet[MAX_STEPS / 4] = {};
   // ----- Runtime state (NOT persisted). Playheads hold 0..MAX_STEPS-1 (63);
   // int8_t is wide enough and saves 2 bytes on each of the 18 resident copies.
   int8_t pitch_pos = 0;
@@ -182,6 +210,18 @@ struct Sequence {
   void set_triplet_mode(bool on) {
     if (on) reserved[0] |= TRIPLET_FLAG;
     else    reserved[0] &= uint8_t(~TRIPLET_FLAG);
+  }
+
+  // Per-step ratchet accessors (2 bits/step; stored 0/2/3 = none/2x/3x).
+  uint8_t ratchet_of(uint8_t step) const {
+    const uint8_t i = step & uint8_t(MAX_STEPS - 1);
+    return (ratchet[i >> 2] >> ((i & 3) << 1)) & 0x03;
+  }
+  void set_ratchet_of(uint8_t step, uint8_t count) {
+    const uint8_t i  = step & uint8_t(MAX_STEPS - 1);
+    const uint8_t sh = uint8_t((i & 3) << 1);
+    ratchet[i >> 2] = uint8_t((ratchet[i >> 2] & ~(0x03u << sh)) |
+                              ((count & 0x03u) << sh));
   }
 
   // ---------------------------------------------------------------------------
@@ -432,6 +472,7 @@ struct Sequence {
   void Clear() {
     for (uint8_t i = 0; i < MAX_STEPS; ++i) pitch[i] = PITCH_EMPTY;
     for (uint8_t i = 0; i < (MAX_STEPS / 4); ++i) time_data[i] = 0;
+    for (uint8_t i = 0; i < (MAX_STEPS / 4); ++i) ratchet[i] = 0;
     for (uint8_t i = 0; i < (METADATA_SIZE - 3); ++i)
       reserved[i] = 0;
     for (uint8_t i = 0; i < (MAX_STEPS / 8); ++i)
@@ -694,21 +735,45 @@ inline void sequence_unpack_per_time(Sequence &s, const uint8_t *in) {
   s.set_pitch_count(k);
 }
 
-inline void normalize_pattern_times_only(Sequence &s) {
-  const uint8_t L = s.length;
-  if (L < 1) return;
-  bool all_tie = true;
-  for (uint8_t i = 0; i < L; ++i) {
-    if (s.time(i) != 2) { all_tie = false; break; }
+// Ratchet permutations. Ratchet is keyed by STEP (time index), so the time
+// permutations (shift, rotate-time, reverse) must carry it the same way they
+// carry time_data -- otherwise a ratchet would be left behind on the old step.
+inline void sequence_rotate_ratchet(Sequence &s, uint8_t len, bool left) {
+  if (len < 2) return;
+  uint8_t tmp[MAX_STEPS];
+  for (uint8_t i = 0; i < len; ++i) tmp[i] = s.ratchet_of(i);
+  if (left) {
+    const uint8_t f = tmp[0];
+    for (uint8_t i = 0; i + 1 < len; ++i) tmp[i] = tmp[i + 1];
+    tmp[len - 1] = f;
+  } else {
+    const uint8_t l = tmp[len - 1];
+    for (int i = int(len) - 1; i > 0; --i) tmp[i] = tmp[i - 1];
+    tmp[0] = l;
   }
-  if (all_tie) sequence_set_time_at(s, 0, 1);
-  if (s.time(0) == 2) sequence_set_time_at(s, 0, 1);
-  // A TIE after a REST is left alone: playback holds the gate only if a NOTE
-  // opened it, so an orphaned tie is just silence. Promoting the rest back to
-  // a NOTE (as this used to do) materialized a phantom note from the queued
-  // pitch stream whenever the user rested a note that had a tie behind it.
+  for (uint8_t i = 0; i < len; ++i) s.set_ratchet_of(i, tmp[i]);
+}
+inline void sequence_reverse_ratchet(Sequence &s, uint8_t len) {
+  for (uint8_t i = 0, j = uint8_t(len - 1); i < j; ++i, --j) {
+    const uint8_t t = s.ratchet_of(i);
+    s.set_ratchet_of(i, s.ratchet_of(j));
+    s.set_ratchet_of(j, t);
+  }
 }
 
+// normalize_pattern_times_only() was REMOVED here (G8 dead code). It forced a
+// step-0 TIE to a NOTE for edits that GENERATE a time stream, but both of its
+// surviving callers (RandomizeFullPattern, RandomizeTimeData) build that stream
+// from fast_rand_time_weighted / fast_rand_time_density, and neither can return
+// TIE when is_first, so both of its branches were unreachable. The removal is
+// measured, not assumed: tools/hosttest/claim014_randomize.cpp asserts the
+// postcondition it used to guarantee, across every length and 128 seed x density
+// combinations. The PERMUTATION edits (shift, rotate-time, reverse) must still
+// never force step 0: doing so adds a NOTE event the permutation did not have,
+// and the new note takes PITCH_DEFAULT instead of the real pitch. That was
+// claim-031, and tools/hosttest/claim031_nudge.cpp is what holds that line.
+// normalize_pattern_times() below is a DIFFERENT function, still live in six
+// places; do not confuse them.
 inline void normalize_pattern_times(Sequence &s) {
   const uint8_t L = s.length;
   if (L < 1) return;
@@ -728,8 +793,16 @@ static inline uint8_t fast_rand_octave_weighted() {
   if (r < 15) return 1;
   return 2;
 }
+// Sequenced into locals deliberately (claim-055): the evaluation order of a
+// call's arguments is UNSPECIFIED in C++, so pack_pitch(fast_rand(13),
+// fast_rand_octave_weighted()) drew the two in whichever order the compiler
+// chose -- avr-gcc 7.3 -Os took the octave first, host clang the semitone.
+// SysEx 0x15 promises that a nonzero seed reproduces, and that has to hold
+// across builds, not per binary. Do not fold these back into one expression.
 static inline uint8_t fast_rand_pitch_byte_weighted() {
-  return pack_pitch(fast_rand(13), fast_rand_octave_weighted());
+  const uint8_t semi = fast_rand(13);
+  const uint8_t oct  = fast_rand_octave_weighted();
+  return pack_pitch(semi, oct);
 }
 // Time: NOTE 60% / REST 25% / TIE 15%, with TIE-after-REST and first-step-no-TIE guards.
 static inline uint8_t fast_rand_time_weighted(uint8_t prev_t, bool is_first) {
@@ -738,6 +811,22 @@ static inline uint8_t fast_rand_time_weighted(uint8_t prev_t, bool is_first) {
   if (r < 12) return 1;
   if (r < 17) return 0;
   return 2;
+}
+// Host randomize (SysEx 0x15, claim-014). density 0..127 is the chance a step is
+// non-rest, so 0 clears and 127 fills. TIEs take a quarter of the non-rest steps,
+// with the panel generator's two guards: no TIE on the first step, no TIE after
+// a REST.
+static constexpr uint8_t RAND_DENSITY_WEIGHTED = 0xFF; // = the panel distribution
+// What Engine::RandomizePattern rerolls. TIME_ONLY keeps the pitch stream in
+// order and only extends it; PITCH_ONLY keeps the time stream and the length.
+static constexpr uint8_t RND_TIME_AND_PITCH = 0;
+static constexpr uint8_t RND_PITCH_ONLY     = 1;
+static constexpr uint8_t RND_TIME_ONLY      = 2;
+static inline uint8_t fast_rand_time_density(uint8_t prev_t, bool is_first, uint8_t density) {
+  if (density == RAND_DENSITY_WEIGHTED) return fast_rand_time_weighted(prev_t, is_first);
+  if (fast_rand(127) >= density) return 0;
+  if (is_first || prev_t == 0) return 1;
+  return (fast_rand(4) == 0) ? 2 : 1;
 }
 static inline uint8_t fast_rand_accent_weighted()  { return (fast_rand(10) < 3) ? 0x40 : 0; }
 static inline uint8_t fast_rand_slide_weighted()   { return (fast_rand(10) < 2) ? 0x80 : 0; }
