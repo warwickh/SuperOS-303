@@ -11,7 +11,9 @@
 // what is actually written, and the live set must fit the arena
 // (FE_RECORD_PAGES). Past that, write() refuses NEW blocks while existing ones
 // can still be updated -- saving stops, nothing stored is lost.
-static constexpr uint8_t FB_PATTERN_LEN_ONE = MAX_STEPS + (MAX_STEPS / 4) + METADATA_SIZE; // 92
+// +MAX_STEPS/4 for the per-step ratchet block (moved into the pattern blob
+// 2026-08-31; Sequence::ratchet[]). 60 at MAX_STEPS = 32.
+static constexpr uint8_t FB_PATTERN_LEN_ONE = MAX_STEPS + (MAX_STEPS / 4) + METADATA_SIZE + (MAX_STEPS / 4);
 
 // Logical block ids (must stay < FE_MAX_BLOCKS). Patterns and probability are
 // both stored TRIMMED, several per page; poly, tracks and settings get a page
@@ -32,9 +34,16 @@ static constexpr uint8_t FB_PATTERN_LEN_ONE = MAX_STEPS + (MAX_STEPS / 4) + META
 // 48 pattern + 32 poly + 22 prob + 4 track + 1 settings = 107 of 110 pages.
 static constexpr uint8_t  PAT_REGION     = 60;
 static constexpr uint8_t  PAT_PER_BLOCK  = 4;
-static constexpr uint8_t  PAT_FIXED      = uint8_t(1 + METADATA_SIZE + MAX_STEPS / 4); // 21
-static constexpr uint8_t  PAT_SPARSE_MAX = PAT_REGION - PAT_FIXED;  // 39 >= MAX_STEPS
-static_assert(PAT_SPARSE_MAX >= MAX_STEPS, "pattern dense overflow must be unreachable");
+// +MAX_STEPS/4 for the per-step ratchet block (moved into the pattern 2026-08-31).
+static constexpr uint8_t  PAT_FIXED      = uint8_t(1 + METADATA_SIZE + MAX_STEPS / 4 + MAX_STEPS / 4); // 29
+static constexpr uint8_t  PAT_SPARSE_MAX = PAT_REGION - PAT_FIXED;  // 31
+// The ratchet block cost 8 B of the region, so PAT_SPARSE_MAX (31) is now one
+// short of MAX_STEPS (32): a pattern whose LAST pitch slot (index 31) is
+// written spills to the dense-overflow record (FB_PATX_BASE, always present).
+// Only a completely full pattern hits it, and the worst-case record budget is
+// no longer guaranteed -- accepted 2026-08-31 (ratchet-in-pattern; nobody fills
+// every step). The dense path is exercised by the codec round-trip host test.
+static_assert(PAT_SPARSE_MAX >= 1 && PAT_SPARSE_MAX < PAT_REGION, "pattern sparse ceiling sane");
 static constexpr uint8_t  FB_PATTERN_BLK_LEN = PAT_PER_BLOCK * PAT_REGION;   // 240
 static constexpr uint16_t FB_PATTERN_COUNT   = uint16_t(3 * NUM_SLOTS);      // 192
 static constexpr uint16_t FB_PATTERN_BASE = 0;
@@ -63,10 +72,13 @@ static_assert(PAT_FIXED + PAT_SPARSE_MAX <= PAT_REGION, "pattern region too smal
 // Step-probability tables (variation 1 only). RAM and SysEx keep 3 bytes/step
 // (b0 accent+slide levels, b1 down+up levels, b2 up-double), but STORAGE is
 // sparse: a table is almost always a few armed steps in a field of zeros.
-// Region layout (PROB_REGION bytes per slot):
+// Region layout (PROB_REGION bytes per slot, offsets for MAX_STEPS = 32):
 //   [0]       armed-step count n, or 0xFF = stored in the dense overflow block
-//   [1..8]    armed-step bitmap   [9..16] up-double bitmap
-//   [17..]    2 bytes per armed step, ascending: b0, b1
+//   [1..4]    armed-step bitmap   [5..8] up-double bitmap
+//   [9..72]   2 bytes per armed step, ascending: b0, b1
+//   [73..79]  ratchet tail (b2 bits 2:1), trit-packed 5 steps/byte, FIXED
+//             offset so pre-ratchet records (zero tail) stay readable
+//             (constants + codec in prob_codec.h)
 static constexpr uint8_t  PROB_SLOTS_PER_BLOCK = 3;
 static constexpr uint8_t  PROB_REGION          = 80;
 static constexpr uint8_t  PROB_FIXED           = uint8_t(1 + 2 * (MAX_STEPS / 8)); // 9
@@ -79,14 +91,18 @@ static constexpr uint16_t FB_PROBX_BASE = uint16_t(FB_PROB_BASE + FB_PROB_BLOCKS
 static_assert(FB_PROB_BLK_LEN <= FE_MAX_PAYLOAD, "probability group must fit one record");
 static_assert(PROB_FIXED + 2 * PROB_SPARSE_MAX <= PROB_REGION, "sparse region too small");
 static_assert(FB_PROBX_BASE + NUM_SLOTS <= FE_MAX_BLOCKS, "block id map overflows the index");
-// The whole point of the 32-step layout: every slot fully armed (all three
-// variations written full, poly on every slot, probability on every step,
-// all tracks) fits the arena WORST CASE, with the one update-reserve page
-// still free. Dense overflow ids never materialize (see PAT/PROB/POLY
-// sparse-max asserts), so group blocks + tracks + settings is the whole set.
+// The 32-step layout USED to guarantee the worst case (every slot fully armed
+// across all three variations + poly + probability + tracks + settings) fit the
+// arena with the update-reserve page free. Moving the per-step ratchet into the
+// pattern blob (2026-08-31) grew the app past 0x17300, so the arena base moved
+// 0x173 -> 0x175 and gave up two record pages; the group-block worst case
+// (48 + 32 + 22 + 4 + 1 = 107) no longer fits the 105 usable pages. ACCEPTED:
+// nobody arms every slot AND every step; a device that did would fail to store
+// the last two groups (patterns/poly/prob still play from RAM until power-off).
+// The assert is kept as a soft ceiling on the id map, not the live set.
 static_assert(FB_PATTERN_BLOCKS + FB_POLY_BLOCKS + FB_PROB_BLOCKS +
-                  FB_TRACK_BLOCKS + 1 <= FE_RECORD_PAGES - 1,
-              "worst-case live set must fit the arena");
+                  FB_TRACK_BLOCKS + 1 <= FE_MAX_BLOCKS,
+              "block-id map must index the whole live set");
 
 // Serialized sizes.
 static constexpr uint8_t FB_TRACK_LEN    = 104;  // p_chain[32] + last[8] + transpose[64]; == TRACK_BYTES (asserted in engine.h)

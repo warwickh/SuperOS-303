@@ -30,9 +30,17 @@
 #include "engine.h"
 #include "pins.h"
 #include "midi_api.h"
+#include "uclock.h"
 #ifdef SUPEROS_COMBINED
 #include <avr/eeprom.h>
 #include "combined.h"
+#endif
+#ifdef SUPEROS_KEY_INJECT
+// 0x5C reads the LED framebuffer. main.cpp owns the Timer3 vector, so this TU
+// must not emit a second one; Leds' state is C++17 inline variables and is
+// shared across TUs either way. Test builds only, so shipping pulls in nothing.
+#define DRIVERS_NO_ISR
+#include "drivers.h"
 #endif
 
 struct SuperOsMidiSettings {
@@ -73,16 +81,24 @@ static bool    s_tick_batch = false;
 static uint8_t s_on_note[8], s_on_vel[8], s_on_ch[8], s_on_n = 0;
 static uint8_t s_off_note[12], s_off_ch[12], s_off_n = 0;
 
+// THRU mode (s_midi_thru): the DIN jack is a pure THRU -- it carries only the
+// echoed input (library thru), never the device's own notes, clock, transport,
+// or SysEx. Without this gate, chaining a second unit off the jack fed it this
+// unit's sequencer output and editor commands even in THRU mode. USB output is
+// never gated: the host always sees the device's own stream.
+static bool s_midi_thru = false;
+static inline bool din_out_ok() { return !s_midi_thru; }
+
 static void out_note_on_now(byte n, byte v, byte ch) {
-  MIDI.sendNoteOn(n, v, ch);
+  if (din_out_ok()) MIDI.sendNoteOn(n, v, ch);
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendNoteOn(n, v, ch);
+  if (usb_sof_alive()) usbMIDI.sendNoteOn(n, v, ch);
 #endif
 }
 static void out_note_off_now(byte n, byte v, byte ch) {
-  MIDI.sendNoteOff(n, v, ch);
+  if (din_out_ok()) MIDI.sendNoteOff(n, v, ch);
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendNoteOff(n, v, ch);
+  if (usb_sof_alive()) usbMIDI.sendNoteOff(n, v, ch);
 #endif
 }
 static void queue_off(byte note, byte ch) {
@@ -101,27 +117,27 @@ static inline void out_note_off(byte n, byte v, byte ch) {
   out_note_off_now(n, v, ch);
 }
 static inline void out_clock() {
-  MIDI.sendClock();
+  if (din_out_ok()) MIDI.sendClock();
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendRealTime(usbMIDI.Clock);
+  if (usb_sof_alive()) usbMIDI.sendRealTime(usbMIDI.Clock);
 #endif
 }
 static inline void out_start() {
-  MIDI.sendStart();
+  if (din_out_ok()) MIDI.sendStart();
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendRealTime(usbMIDI.Start);
+  if (usb_sof_alive()) usbMIDI.sendRealTime(usbMIDI.Start);
 #endif
 }
 static inline void out_stop() {
-  MIDI.sendStop();
+  if (din_out_ok()) MIDI.sendStop();
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendRealTime(usbMIDI.Stop);
+  if (usb_sof_alive()) usbMIDI.sendRealTime(usbMIDI.Stop);
 #endif
 }
 static inline void out_continue() {
-  MIDI.sendContinue();
+  if (din_out_ok()) MIDI.sendContinue();
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendRealTime(usbMIDI.Continue);
+  if (usb_sof_alive()) usbMIDI.sendRealTime(usbMIDI.Continue);
 #endif
 }
 
@@ -129,7 +145,6 @@ static Engine *g_eng = nullptr;
 static bool g_clk_run = false;
 static uint8_t s_in_channel = 0; // 0 = omni
 static bool s_midi_clock_rx = true;
-static bool s_midi_thru = false;
 // Deferred settings persistence: set by the 0x22 handler, flushed by
 // midi_flush_pending_saves() so EEPROM writes don't stall RX inside SysEx parsing.
 static bool s_settings_dirty = false;
@@ -225,16 +240,18 @@ static bool s_usb_host_seen = false;
 static inline bool host_seen_any() { return s_din_host_seen || s_usb_host_seen; }
 
 static bool tx_push_message(const uint8_t *inner, uint16_t inner_len) {
+  // SysEx TX master switch (settings flag). "Sent" so callers never retry.
+  if (!GlobalSettings.sysex_tx_enable) return true;
 #ifdef SUPEROS_USB_MIDI
   // USB before the DIN ring, and never gated on ring space: the web editor (USB
   // host) handshakes far faster than the 31250-baud Serial1 ring drains, so the
   // DIN ring fills after a handful of replies. Gating USB on ring space dropped
   // replies mid-dump (the "stalls at ~6/48" bug). hasTerm=false -> the core wraps
   // F0..F7 around `inner`. Non-blocking / dropped when no USB host is configured.
-  if (s_usb_host_seen)
+  if (s_usb_host_seen && usb_sof_alive())
     usbMIDI.sendSysEx(inner_len, inner, false);
 #endif
-  if (!s_din_host_seen) return true;
+  if (!s_din_host_seen || !din_out_ok()) return true;
   // DIN (Serial1) ring: check space first so we never leave a partial F0..no-F7.
   uint16_t avail = (s_tx_r + kTxCap - s_tx_w - 1) % kTxCap;
   if (avail < inner_len + 2) return false; // ring full -> DIN drops it (USB already sent)
@@ -424,7 +441,9 @@ static void dump_try_advance() {
 static void send_config_reply() {
   static const char kVer[] = SUPEROS_VERSION;
   const uint8_t fl  = static_cast<uint8_t>((GlobalSettings.midi_clock_receive ? 1 : 0) |
-                                            (GlobalSettings.midi_thru          ? 2 : 0));
+                                            (GlobalSettings.midi_thru          ? 2 : 0) |
+                                            (GlobalSettings.sysex_rx_enable    ? 0 : 4) |
+                                            (GlobalSettings.sysex_tx_enable    ? 0 : 8));
   const uint8_t dir = g_eng ? static_cast<uint8_t>(g_eng->get_direction()) : 0;
   uint8_t inner[8 + sizeof(kVer) - 1];
   inner[0] = 0x7D; inner[1] = 0x21;
@@ -479,10 +498,90 @@ static void handle_sysex_body(const uint8_t *p, unsigned n) {
   if (p[0] != 0x7D) return;
   const uint8_t cmd = p[1];
 
+  // SysEx RX master switch. Config (0x20/0x22) stays reachable so the switch
+  // can be flipped back remotely, and 0x4A (bootloader jump) stays reachable
+  // so a firmware update can never be locked out.
+  if (!GlobalSettings.sysex_rx_enable &&
+      cmd != 0x20 && cmd != 0x22 && cmd != 0x4A)
+    return;
+
   switch (cmd) {
   case 0x36: // web editor: D650C mask-ROM status query -> 0x37 reply
     midi_send_rom_status();
     break;
+  case 0x56: { // read internal EEPROM -> 0x57. <addr_lo7> <addr_hi5> <count>,
+               // count 1..32, reply carries the same header then the bytes
+               // 7-bit packed. Read-only; there is deliberately no write.
+               //
+               // MOVED FROM 0x4E, which was a COLLISION and never reached
+               // hardware. 0x4E is the fleet's shared ADDRESSED ENVELOPE
+               // (F0 7D 4E <dev> <opcode> <payload> F7, claim-078,
+               // SuperOS-USBC docs/OPCODES.tsv). I censused BOTH 303 switch
+               // statements and 0x4E is genuinely absent from them, because
+               // that entry is ALLOCATED and not yet IMPLEMENTED anywhere.
+               // **A source census cannot see a reserved-but-unimplemented
+               // opcode.** Check docs/OPCODES.tsv (tools/opcode_free.py
+               // --check) as well as the switches.
+               // It is also the worst byte to collide with: it carries every
+               // OTHER opcode to an addressed machine, so a 303 answering
+               // 0x4E with an EEPROM read would consume addressed traffic
+               // aimed at every other machine, and the symptom would look like
+               // bus corruption rather than an allocation fault.
+               //
+               // WHY THIS EXISTS: claim-086's decisive instruments are the boot
+               // counter and the WDT-recovery counter in internal EEPROM
+               // (EE_BOOT_COUNT / EE_WDT_COUNT, src/combined.h), and until now
+               // there was NO SysEx path to any of them, so reading them needed
+               // the ISP ribbon, which lives on another machine and needs a
+               // hand. That put a hand on the critical path of a headless
+               // fleet. It also replaces the 1 Hz EEPROM liveness heartbeat
+               // that combined.cpp used to write, which wore a cell out at
+               // ~28 h of uptime and whose failure mode was indistinguishable
+               // from the fault it watched for.
+    if (n < 5) return;
+    const uint16_t addr = uint16_t(p[2] | (uint16_t(p[3]) << 7));
+    uint8_t count = p[4];
+    if (count == 0 || count > 32) return;
+    if (addr >= 4096) return;
+    if (uint16_t(addr + count) > 4096) count = uint8_t(4096 - addr);
+    uint8_t raw[32];
+    for (uint8_t i = 0; i < count; ++i)
+      raw[i] = eeprom_read_byte((const uint8_t *)(uintptr_t)(addr + i));
+    uint8_t r[5 + 37];
+    r[0] = 0x7D; r[1] = 0x57; r[2] = p[2]; r[3] = p[3]; r[4] = count;
+    const uint16_t pl = pack_7bit(raw, count, r + 5);
+    tx_push_message(r, uint16_t(5 + pl));
+    break;
+  }
+  case 0x3B: { // USB bring-up probe -> 0x3C: live USB-engine registers, frame
+    // counter sampled twice 2.5 ms apart (SOFs must advance it), the SOF
+    // gate's verdict. Nibble-encoded pairs [hi, lo], 14 raw bytes; layout
+    // matches the 606's probe (decoder: SuperOS-606FIRMWARE tools/bench/
+    // usbprobe.swift), 303 fills the 606 matrix slots with raw PINB.
+    uint8_t raw[14];
+    uint8_t rn = 0;
+#ifdef SUPEROS_USB_MIDI
+    extern volatile uint8_t usb_configuration;
+    raw[rn++] = USBCON; raw[rn++] = UDCON; raw[rn++] = UDIEN; raw[rn++] = UDINT;
+    raw[rn++] = usb_configuration;
+    raw[rn++] = UDFNUML; raw[rn++] = UDFNUMH;
+    delayMicroseconds(2500);
+    raw[rn++] = UDFNUML; raw[rn++] = UDFNUMH;
+    raw[rn++] = usb_sof_alive() ? 1 : 0;
+#else
+    for (uint8_t i = 0; i < 10; ++i) raw[rn++] = 0x7F;
+#endif
+    raw[rn++] = PINB; raw[rn++] = 0; raw[rn++] = 0; raw[rn++] = PINB;
+    uint8_t inner[2 + 2 * sizeof(raw)];
+    inner[0] = 0x7D; inner[1] = 0x3C;
+    uint8_t m = 2;
+    for (uint8_t i = 0; i < rn; ++i) {
+      inner[m++] = (uint8_t)(raw[i] >> 4);
+      inner[m++] = (uint8_t)(raw[i] & 0x0F);
+    }
+    tx_push_message(inner, m);
+    break;
+  }
   case 0x34: { // panel diagnostic -> 0x35: debounced held-state of every input
     // (7 inputs per byte, InputIndex order) + the derived DialMode. Lets a
     // host see the mode dial, group dial and modifier keys remotely.
@@ -496,6 +595,56 @@ static void handle_sysex_body(const uint8_t *p, unsigned n) {
     tx_push_message(r, sizeof(r));
     break;
   }
+#ifdef SUPEROS_KEY_INJECT
+  case 0x4B: { // headless key inject (test only, mirrors the d650 emulator's 0x4B):
+               // <idx> <mode> for input idx; idx >= INPUT_COUNT clears all.
+               // g_key_inject folds into PollInputs, so it debounces like a real key.
+               // Verify via 0x34 -> 0x35 (held-state bitmap). Walks the SuperOS panel
+               // over USB with no fingers (gate G1 / claim-017). Built in env app-inject.
+               //
+               // mode is TRI-STATE since claim-116 (see pins.h):
+               //   0  pass the real pin through
+               //   1  force PRESSED
+               //   2  force RELEASED
+               // 0 and 1 are unchanged from the OR-only version, so existing walk
+               // scripts keep working. 2 exists because WRITE_MODE and TRACK_SEL are
+               // physical DIAL bits: without a way to force one LOW, Pattern Play and
+               // Track Play could not be reached headless at all.
+    if (n >= 4) {
+      if (p[2] >= INPUT_COUNT) memset(g_key_inject, 0, INPUT_COUNT);
+      else                     g_key_inject[p[2]] = p[3] & 3;
+    }
+    break;
+  }
+  case 0x5C: { // LED diagnostic -> 0x5D: the published LED frame, so a host can
+               // score the manual's "LED shows ..." rows headlessly. 0x34 reads
+               // INPUTS; before this the 303 had no LED readback at all and every
+               // such row was unreachable without an eye on the panel (gate G1).
+               //
+               // Reads back[], NOT front[]. Swap() publishes front -> back and
+               // then ZEROES front, so front is a partially rebuilt frame at any
+               // moment inside the loop and would report LEDs as dark that are
+               // lit. back[] is the frame the ISR is actually driving.
+               // Same thread as Swap() (both main loop), so no tearing and no cli.
+               //
+               // A SNAPSHOT CANNOT SEE A BLINK. Rows that say "blinking" need the
+               // host to poll this repeatedly and watch the bit toggle; isr_tick
+               // is returned so a host can prove frames are advancing and it is
+               // not reading one frozen frame. Test-build only, like 0x4B.
+    uint8_t r[10];
+    r[0] = 0x7D; r[1] = 0x5D;
+    memset(r + 2, 0, sizeof(r) - 2);
+    for (uint8_t i = 0; i < TOTAL_LEDS; ++i) {
+      const uint8_t row = uint8_t(i >> 3), bit = uint8_t(i & 7);
+      if ((Leds::back[row]     >> bit) & 1) r[2 + i / 7] |= uint8_t(1 << (i % 7));
+      if ((Leds::back_dim[row] >> bit) & 1) r[5 + i / 7] |= uint8_t(1 << (i % 7));
+    }
+    r[8] = Leds::brightness & 0x7F;
+    r[9] = Leds::isr_tick   & 0x7F;
+    tx_push_message(r, sizeof(r));
+    break;
+  }
+#endif
   case 0x10: { // request pattern; optional trailing <var> selects the variation
     if (n < 3) return;
     const uint8_t pat = p[2] & 0x0F;
@@ -546,6 +695,42 @@ static void handle_sysex_body(const uint8_t *p, unsigned n) {
     s_dump_active = true;
     dump_try_advance();
     break;
+  case 0x2E: { // host → 303: randomize a pattern (claim-014 shared edit opcode).
+               // <pat> <lane> <density> <seed_lo> <seed_hi>. lane 0x7F = every
+               // lane; the 303 has none, so 0x7F and 0 are the only accepted
+               // values and anything else acks 2 (claim-057: a machine must not
+               // silently widen an unknown lane to the whole pattern).
+               // density 0..127 = chance a step is non-rest (0 clears, 127
+               // fills). seed 14-bit, 0 = entropy, nonzero = deterministic so a
+               // G4 capture repeats.
+               // NOT 0x15: the 303 EMITS 0x15 as the playhead-wrap anchor, once
+               // per wrap, and direction is not a property a MIDI cable
+               // preserves. With thru on (this machine has the toggle), a DAW
+               // echo, or a host that re-emits unrecognised SysEx, the machine's
+               // own anchor came back as RANDOMIZE and silently destroyed the
+               // pattern once per wrap, faster at higher tempo.
+               // NOT 0x38 either, which this was built on first: 0x38 is
+               // CMD_FRAM_PROBE inbound on the 606 (A606 found it), and CORE's
+               // ruling is that an opcode is safe as a property of the WIRE, not
+               // of one firmware's dispatch table. 0x2E is confirmed free in
+               // BOTH directions on BOTH 303 firmwares and on the FRAM branch's
+               // reserved 0x30-0x33 set; see docs/OPCODES.tsv and
+               // docs/EDIT_OPCODES.md.
+    if (n < 7 || !g_eng) { send_ack(1); return; }
+    // Dispatched in main.cpp (see engine_host_randomize there): calling the
+    // Engine method from this TU duplicates every static-inline PRNG helper.
+    extern uint8_t engine_host_randomize(uint8_t, uint8_t, uint8_t, uint16_t);
+    const uint8_t  pat  = p[2] & 0x7F;
+    const uint16_t seed = uint16_t(p[5] & 0x7F) | uint16_t((p[6] & 0x7F) << 7);
+    // Range rule and ack status live in Engine::HostRandomize, one place, and are
+    // covered by tools/hosttest/claim014_randomize.cpp.
+    const uint8_t st = engine_host_randomize(pat, p[3] & 0x7F, p[4] & 0x7F, seed);
+    // Same deferred-save path as 0x16/0x18: never write flash inline, it blocks
+    // the UART long enough to drop the next SysEx.
+    if (st == 0) mark_pat_dirty(pat);
+    send_ack(st);
+    break;
+  }
   case 0x16: { // host → 303: set single step (pitch + time); optional trailing <var>
     if (n < 7 || !g_eng) return;
     const uint8_t pat  = p[2] & 0x0F;
@@ -738,6 +923,22 @@ static void handle_sysex_body(const uint8_t *p, unsigned n) {
     }
     break;
   }
+  case 0x28: { // host -> 303: set one step's ratchet count (0/2/3), var1 only.
+    // Ratchet is pattern data now; var1 patterns live in pattern[pat] (active
+    // bank), same as the 0x16 var==0 path.
+    if (n < 5 || !g_eng) return;
+    const uint8_t pat   = p[2] & 0x0F;
+    const uint8_t step  = p[3] & 0x3F;
+    const uint8_t count = p[4] & 0x03;
+    Sequence &seq = g_eng->pattern[pat];
+    if (step < seq.length) {
+      seq.set_ratchet_of(step, count);
+      g_eng->stale = true;
+      mark_pat_dirty(pat);
+    }
+    s_last_web_edit_ms = millis();
+    break; // never echoed
+  }
   case 0x2B: { // host -> 303: set one step's three probability bytes (var1 only)
     if (n < 7 || !g_eng) return;
     const uint8_t pat  = p[2] & 0x0F;
@@ -834,6 +1035,11 @@ static void handle_sysex_body(const uint8_t *p, unsigned n) {
     if (ch <= 16) GlobalSettings.midi_channel = ch;
     GlobalSettings.midi_clock_receive = (fl & 1) != 0;
     GlobalSettings.midi_thru          = (fl & 2) != 0;
+    // Bits 2/3 are DISABLED bits, so an old editor (which sends them as 0)
+    // leaves SysEx enabled. RX-off still accepts 0x20/0x22/0x4A (see the gate
+    // in handle_sysex_body), so an editor can always turn RX back on.
+    GlobalSettings.sysex_rx_enable = (fl & 4) == 0;
+    GlobalSettings.sysex_tx_enable = (fl & 8) == 0;
     if (n >= 5 && g_eng) {
       const SequenceDirection d = static_cast<SequenceDirection>(p[4] & 0x07);
       g_eng->SetDirection(d);
@@ -1253,6 +1459,15 @@ void midi_send_prob_step(uint8_t pat, uint8_t step, uint8_t b0, uint8_t b1, uint
   tx_push_message(inner, 8);
 }
 
+// 0x2E: one step's ratchet count (0/2/3), variation 1 only. Ratchet is pattern
+// data (Sequence::ratchet[]); this mirrors a panel edit to the web and lets the
+// web set a single step without pushing the whole blob.
+void midi_send_ratchet_step(uint8_t pat, uint8_t step, uint8_t count) {
+  const uint8_t inner[5] = {0x7D, 0x28, (uint8_t)(pat & 0x0F),
+                            (uint8_t)(step & 0x3F), (uint8_t)(count & 0x03)};
+  tx_push_message(inner, 5);
+}
+
 // Broadcast ONE variation-3 poly step (device -> host) after a hardware chord edit,
 // so the web editor mirrors panel edits live. Same 0x27 wire as the host->device edit;
 // the device only sends this on hardware edits and never echoes a received 0x27, so
@@ -1355,16 +1570,23 @@ static uint8_t s_seq_note_ch = 0;   // channel the open main note was sent on
 // DIN-sync mode already does (it generates the clock on OUT). Clock is forwarded
 // 1:1 so piled-up pulses aren't under-sent.
 static void rx_clock(uint8_t &midi_clock_pulses) {
-  if (s_midi_clock_rx) { ++midi_clock_pulses; out_clock(); }
+  (void)midi_clock_pulses;
+  // Feed the uClock smoother at wire-arrival time; the engine tick fires from
+  // uclk::Poll() at the end of midi_poll, on the smoothed timebase. Clock is
+  // still FORWARDED 1:1 at arrival (downstream gear does its own smoothing).
+  if (s_midi_clock_rx) { uclk::OnClockByte(micros()); out_clock(); }
 }
 static void rx_start(Engine &engine, bool &midi_clk) {
-  if (s_midi_clock_rx) { midi_clk = true; engine.Reset(); out_start(); }
+  // Reset the smoother: the next 0xF8 is the downbeat and fires on arrival.
+  if (s_midi_clock_rx) { midi_clk = true; engine.Reset(); uclk::Reset(); out_start(); }
 }
 static void rx_continue(bool &midi_clk) {
-  if (s_midi_clock_rx) { midi_clk = true; out_continue(); } // resume (no reset)
+  if (s_midi_clock_rx) { midi_clk = true; uclk::Reset(); out_continue(); } // resume (no reset)
 }
 static void rx_stop(Engine &engine, bool &midi_clk) {
-  if (s_midi_clock_rx) { midi_clk = false; engine.Reset(); out_stop(); }
+  // Reset drops any owed-but-unfired smoothed ticks so they cannot step the
+  // engine after the transport stopped.
+  if (s_midi_clock_rx) { midi_clk = false; engine.Reset(); uclk::Reset(); out_stop(); }
 }
 // CC 0 = group (0-3), CC 32 = section (0=patterns 0-7, 1=patterns 8-15).
 static void rx_control_change(uint8_t ch, uint8_t cc, uint8_t val) {
@@ -1456,6 +1678,10 @@ void midi_poll(Engine &engine, bool clk_run, bool &midi_clk, uint8_t &midi_clock
   }
 #endif
 
+  // Drain the smoothed clock: engine ticks fire at their predicted times, not
+  // at raw byte arrival, so USB delivery jitter/bursts never reach the voice.
+  if (s_midi_clock_rx) midi_clock_pulses = uclk::Poll(micros());
+
   midi_tx_drain();
   dump_try_advance();
 }
@@ -1483,12 +1709,16 @@ void midi_tick_flush() {
 #ifdef SUPEROS_USB_MIDI
   // USB first: all events written back-to-back, then committed as one packet so
   // the host timestamps every voice of this tick identically.
-  for (uint8_t i = 0; i < s_on_n; ++i)  usbMIDI.sendNoteOn(s_on_note[i], s_on_vel[i], s_on_ch[i]);
-  for (uint8_t i = 0; i < s_off_n; ++i) usbMIDI.sendNoteOff(s_off_note[i], 0, s_off_ch[i]);
-  usbMIDI.send_now();
+  if (usb_sof_alive()) {
+    for (uint8_t i = 0; i < s_on_n; ++i)  usbMIDI.sendNoteOn(s_on_note[i], s_on_vel[i], s_on_ch[i]);
+    for (uint8_t i = 0; i < s_off_n; ++i) usbMIDI.sendNoteOff(s_off_note[i], 0, s_off_ch[i]);
+    usbMIDI.send_now();
+  }
 #endif
-  for (uint8_t i = 0; i < s_on_n; ++i)  MIDI.sendNoteOn(s_on_note[i], s_on_vel[i], s_on_ch[i]);
-  for (uint8_t i = 0; i < s_off_n; ++i) MIDI.sendNoteOff(s_off_note[i], 0, s_off_ch[i]);
+  if (din_out_ok()) {
+    for (uint8_t i = 0; i < s_on_n; ++i)  MIDI.sendNoteOn(s_on_note[i], s_on_vel[i], s_on_ch[i]);
+    for (uint8_t i = 0; i < s_off_n; ++i) MIDI.sendNoteOff(s_off_note[i], 0, s_off_ch[i]);
+  }
   s_on_n = 0;
   s_off_n = 0;
 }

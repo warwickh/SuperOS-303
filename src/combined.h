@@ -16,17 +16,89 @@
 //   0x620..0xE1F     user-loaded D650C mask ROM (2048 bytes; the D650_ROM_IN_RAM
 //                    build lets the user upload their own dump via SysEx over
 //                    USB-C or DIN -- see src/d650/rom_store.h)
-//   0xE20..0xFFF     free
+//   0xE20..0xFEF     free
+//   0xFF0..0xFF3     TEMP wedge diagnostics (combined.cpp): boot crumb, 1 Hz
+//                    heartbeat, boot counter, WDT-recovery counter. These were
+//                    BARE ADDRESS LITERALS in combined.cpp and appeared in no
+//                    map, which is the shape of the fault A808 found twice in
+//                    one instrument on 2026-08-26: a diagnostic block silently
+//                    overlapping real data, corrupting it slowly, with the
+//                    symptom nowhere near the cause. Named and asserted here.
 #pragma once
 #include <stdint.h>
 
-#define EE_FW_SELECT   ((uint8_t *)0x000)
-#define EE_EMU_MAGIC   ((uint8_t *)0x001)
-#define EE_ROM_MAGIC   ((uint8_t *)0x002)
-#define EE_ROM_SUM     ((uint8_t *)0x003)
-#define EE_EMU_SETTINGS ((uint8_t *)0x008)
-#define EE_EMU_PATT    ((uint8_t *)0x020)
-#define EE_ROM_DATA    ((uint8_t *)0x620)
+// THE INTEGERS ARE THE MAP. The pointers below are DERIVED from them, and that
+// is the whole point of the ordering: this block used to define the pointers as
+// literals and the integers as a parallel copy, with a comment saying "keep
+// these equal". A comment is not a check. If the two had ever drifted, the
+// static_asserts would have gone on checking the copy while the code used the
+// pointers, which is a guard that passes while the thing it guards is wrong.
+// (A303, 2026-08-26, on A808's report that both of the 808's remaining EEPROM
+// overlaps came from addresses at call sites that no assert mentioned.)
+//
+// The asserts must sit on the INTEGERS: a cast from a pointer to an integer is
+// not a constant expression, so a static_assert on the pointer form is not a
+// check. It compiles on avr-gcc as an extension and fails under clang, so an
+// AVR-only tree can carry those asserts passing by luck (A101 hit the clang
+// half, A808 measured the avr-gcc half).
+static constexpr uint16_t EE_SIZE          = 4096;
+static constexpr uint16_t EE_OFF_FW_SELECT = 0x000;
+static constexpr uint16_t EE_OFF_EMU_MAGIC = 0x001;
+static constexpr uint16_t EE_OFF_ROM_MAGIC = 0x002;
+static constexpr uint16_t EE_OFF_ROM_SUM   = 0x003;
+static constexpr uint16_t EE_OFF_SETTINGS  = 0x008;
+static constexpr uint16_t EE_OFF_PATT      = 0x020;
+static constexpr uint16_t EE_OFF_ROM       = 0x620;
+static constexpr uint16_t EE_OFF_DIAG      = 0xFF0;
+static constexpr uint16_t EE_DIAG_LEN      = 4;
+
+// EE_ROM_SUM IS TWO BYTES WIDE and until 2026-08-26 nothing said so: the map
+// listed it as one address and rom_store.h writes EE_ROM_SUM and EE_ROM_SUM+1.
+// Byte 0x004 was therefore free-looking and reachable, and taking it would have
+// clobbered the checksum's high byte with every assert still passing.
+static constexpr uint16_t EE_ROM_SUM_LEN   = 2;
+
+// The four diagnostic bytes, by NAME, in the map. They used to be defined only
+// in combined.cpp as EE_DIAG_BASE + 0..3, so EE_DIAG_LEN = 4 was a hand-kept
+// coincidence in a different file: a fifth crumb at +4 would not have moved it
+// and the region assert would have gone on passing. The offsets live here now
+// and the assert is against the highest one, not against a remembered count.
+static constexpr uint16_t EE_OFF_BOOT_CRUMB = EE_OFF_DIAG + 0;
+static constexpr uint16_t EE_OFF_HEARTBEAT  = EE_OFF_DIAG + 1;
+static constexpr uint16_t EE_OFF_BOOT_COUNT = EE_OFF_DIAG + 2;
+static constexpr uint16_t EE_OFF_WDT_COUNT  = EE_OFF_DIAG + 3;
+static constexpr uint16_t EE_DIAG_HIGHEST   = EE_OFF_WDT_COUNT;
+
+#define EE_PTR(off)    ((uint8_t *)(uintptr_t)(off))
+#define EE_FW_SELECT   EE_PTR(EE_OFF_FW_SELECT)
+#define EE_EMU_MAGIC   EE_PTR(EE_OFF_EMU_MAGIC)
+#define EE_ROM_MAGIC   EE_PTR(EE_OFF_ROM_MAGIC)
+#define EE_ROM_SUM     EE_PTR(EE_OFF_ROM_SUM)
+#define EE_EMU_SETTINGS EE_PTR(EE_OFF_SETTINGS)
+#define EE_EMU_PATT    EE_PTR(EE_OFF_PATT)
+#define EE_ROM_DATA    EE_PTR(EE_OFF_ROM)
+#define EE_DIAG_BASE   EE_PTR(EE_OFF_DIAG)
+
+// The head region (fw select, the two magics, the ROM checksum) had no integer
+// twins and no assert at all: four bare address literals appearing in no map,
+// which is the same thing claim-036 found in the diagnostic bytes. Asserted now.
+static_assert(EE_OFF_FW_SELECT == 0,           "fw select must be EEPROM byte 0");
+static_assert(EE_OFF_EMU_MAGIC == EE_OFF_FW_SELECT + 1, "emu magic follows fw select");
+static_assert(EE_OFF_ROM_MAGIC == EE_OFF_EMU_MAGIC + 1, "rom magic follows emu magic");
+static_assert(EE_OFF_ROM_SUM   == EE_OFF_ROM_MAGIC + 1, "rom sum follows rom magic");
+static_assert(EE_OFF_ROM_SUM + EE_ROM_SUM_LEN <= EE_OFF_SETTINGS,
+              "the head (incl. the 2-byte ROM checksum) runs into settings");
+static_assert(EE_OFF_SETTINGS  <  EE_OFF_PATT, "settings run into the pattern store");
+static_assert(EE_OFF_PATT      <  EE_OFF_ROM,  "pattern store runs into the mask ROM");
+static_assert(EE_OFF_ROM       <  EE_OFF_DIAG, "mask ROM runs into the diagnostics");
+static_assert(EE_OFF_DIAG + EE_DIAG_LEN <= EE_SIZE, "diagnostics run off the end");
+static_assert(EE_DIAG_HIGHEST < EE_OFF_DIAG + EE_DIAG_LEN,
+              "a diagnostic byte sits past EE_DIAG_LEN");
+
+#define EE_BOOT_CRUMB  EE_PTR(EE_OFF_BOOT_CRUMB)
+#define EE_HEARTBEAT   EE_PTR(EE_OFF_HEARTBEAT)
+#define EE_BOOT_COUNT  EE_PTR(EE_OFF_BOOT_COUNT)
+#define EE_WDT_COUNT   EE_PTR(EE_OFF_WDT_COUNT)
 
 static constexpr uint8_t FW_SUPEROS = 0;   // also 0xFF (virgin EEPROM)
 static constexpr uint8_t FW_D650    = 1;

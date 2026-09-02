@@ -111,6 +111,9 @@ static uint32_t g_stat_ms = 0;
 // stall (flash program, USB blocking, ISR storm) with ~us resolution while a
 // user reproduces a lag report over the SysEx poll.
 static uint32_t g_max_gap_us = 0, g_max_pass_us = 0;
+// claim-091: set by build_status_reply so the pass that ANSWERS the 0x40
+// probe does not become the first sample of the window it just opened.
+static volatile uint8_t g_probe_pass = 0;
 // Loop-shape counters (1 Hz): passes/s and wall time inside the emulation
 // batch per second. Together with cyc/s these solve the pass-budget equation
 // (per-pass overhead vs interpreter cost) on live production hardware.
@@ -129,8 +132,28 @@ static uint8_t  g_gate_prev  = 0;
 
 // pattern persistence: the full 3x uPD444 store is D650_EXT_BYTES (1536) packed
 // bytes, split into 192-byte flash blocks (ids 100..107).
+// The EEPROM map in src/combined.h is written in numbers that this file cannot
+// see from there. Tie them together HERE, where the real sizes are visible.
+// A808 found two silent overlaps in one instrument on 2026-08-26 (a probe
+// record running past its base into EE_EMU_PATT, and three aux blocks inside
+// EE_IMG_DATA rewriting every 4 s). The fix to copy is the assert, not the
+// address move: the addresses on this machine were already correct and nothing
+// would have said so if they had not been.
+#ifdef SUPEROS_COMBINED
+static_assert(EE_OFF_SETTINGS + EMU_SETTINGS_LEN <= EE_OFF_PATT,
+              "d650 settings overlap the uPD444 pattern store");
+static_assert(EE_OFF_PATT + D650_EXT_BYTES <= EE_OFF_ROM,
+              "uPD444 pattern store overlaps the uploaded mask ROM");
+static_assert(EE_OFF_ROM + D650_ROM_SIZE <= EE_OFF_DIAG,
+              "uploaded mask ROM overlaps the wedge diagnostics");
+#endif
+
 static const uint8_t PATT_BLK_BASE = 100, PATT_BLK_LEN = 192;
+// 0x47 bounds blk by PATT_BLK_N; this is the check that PATT_BLK_N * the block
+// length cannot address past the store it is writing into.
 static const uint8_t PATT_BLK_N = D650_EXT_BYTES / PATT_BLK_LEN;   // 8
+static_assert(PATT_BLK_N * (uint16_t)PATT_BLK_LEN <= D650_EXT_BYTES,
+              "pattern block writes run past the uPD444 store");
 
 // Deferred incremental pattern save (see loop). flash_write_page halts the
 // CPU ~9 ms/page, and when the append bank fills, FlashEeprom's GC reprograms
@@ -204,15 +227,19 @@ static uint8_t midi_out_ch() { return g_set.midi_channel ? (uint8_t)(g_set.midi_
 static void send_note_on (void *, uint8_t n, uint8_t v){
   midi_tx(0x90|midi_out_ch()); midi_tx(n); midi_tx(v);
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendNoteOn(n, v, (uint8_t)(midi_out_ch() + 1));
-  usbMIDI.send_now();
+  if (usb_sof_alive()) {
+    usbMIDI.sendNoteOn(n, v, (uint8_t)(midi_out_ch() + 1));
+    usbMIDI.send_now();
+  }
 #endif
 }
 static void send_note_off(void *, uint8_t n){
   midi_tx(0x80|midi_out_ch()); midi_tx(n); midi_tx(0);
 #ifdef SUPEROS_USB_MIDI
-  usbMIDI.sendNoteOff(n, 0, (uint8_t)(midi_out_ch() + 1));
-  usbMIDI.send_now();
+  if (usb_sof_alive()) {
+    usbMIDI.sendNoteOff(n, 0, (uint8_t)(midi_out_ch() + 1));
+    usbMIDI.send_now();
+  }
 #endif
 }
 
@@ -590,7 +617,7 @@ static void clock_out_service() {
     ++s_clk_out_mark;
     midi_tx(0xF8);
 #ifdef SUPEROS_USB_MIDI
-    usbMIDI.sendRealTime(0xF8);
+    if (usb_sof_alive()) usbMIDI.sendRealTime(0xF8);
 #endif
   }
 }
@@ -666,14 +693,28 @@ static uint8_t build_status_reply(uint8_t *r) {
   for (uint8_t i = 0; i < 6; i++) r[40 + i] = 0;
   for (uint8_t i = 0; i < D650_IN_COUNT; i++)
     if (H.in[i]) r[40 + i / 7] |= (uint8_t)(1 << (i % 7));
+  // claim-091: the 128 us quantum above cannot resolve this telemetry's own
+  // effect size. Measured 2026-08-26: mean pass is 1213 us (g_pass_per_s=824)
+  // and max_pass reads 1408-1536 us, so the whole quantity lives in 11-12
+  // quanta and a one-quantum step is 9% of the reading. The probe's own reply
+  // cost, which is what claim-091 is about, is 143..691 us depending on how
+  // the reply splits into fixed overhead and per-byte cost -- i.e. 1.1 to 5.4
+  // quanta, straddling the resolution. The experiment could not separate "the
+  // fix took" from "the fix did not take" for that reason alone.
+  // These two bytes carry the REMAINDER inside the quantum, so a host can
+  // reconstruct the figure to 1 us. APPENDED, not re-scaled: r[0..45] keep
+  // their meaning and their units, so every existing reader is unaffected.
+  r[46] = (uint8_t)(g_max_gap_us  & 0x7F);
+  r[47] = (uint8_t)(g_max_pass_us & 0x7F);
   g_max_gap_us = g_max_pass_us = 0;
-  return 46;
+  g_probe_pass = 1;
+  return 48;
 }
 #ifdef D650_ROM_IN_RAM
 // DIN 0x41 status reply: lets the web editor's connection probe (0x40) detect a
 // D650C unit over DIN as well as USB, so a ROM upload can be driven over either.
 static void din_send_status() {
-  uint8_t r[46];
+  uint8_t r[48];
   const uint8_t n = build_status_reply(r);
   midi_tx(0xF0);
   for (uint8_t i = 0; i < n; i++) midi_tx(r[i]);
@@ -707,10 +748,28 @@ static void enter_bootloader() {
 static bool chan_ok(uint8_t ch /*1..16*/) {
   return g_set.midi_channel == 0 || ch == g_set.midi_channel;
 }
+// claim-091: `0x40 [pad]` -- an OPTIONAL trailing byte appends `pad` filler
+// bytes to the reply. The claim asks whether the published max_pass is the
+// MACHINE's worst pass or the cost of the pass that ANSWERS the probe, and no
+// window-length test can separate those on this machine: EMU_MAX_BATCH caps
+// per-pass emulation work, so pass duration has a deterministic ceiling and
+// the maximum is flat in window length under BOTH hypotheses (measured
+// 2026-08-26, two sweeps, 0.25..8.0 s, per-interval worst flat to 20 us).
+// Reply SIZE is the only lever that changes the probe pass without touching
+// ordinary passes. If max_pass tracks `pad`, the figure is the probe's own
+// cost; if it is independent of `pad`, the claim-091 fix works.
+// Bare `0x40` is pad 0, so every existing caller is unchanged.
+// Ceiling is 32, not 64: this buffer is a STACK frame and claim-080 on the 808
+// was a stack overflow from exactly this shape (a 243 B buffer in a leaf).
+// With the 1 us telemetry resolution, 32 bytes is ~125 us of transmit, far
+// more than needed to resolve; there is no reason to spend more stack.
+static uint8_t g_status_pad = 0;      // extra bytes on the NEXT reply, 0..32
 static void usb_send_status() {
-  uint8_t r[46];
-  const uint8_t n = build_status_reply(r);
-  usbMIDI.sendSysEx(n, r, false);   // core wraps F0 .. F7
+  uint8_t r[48 + 32];
+  uint8_t n = build_status_reply(r);
+  for (uint8_t i = 0; i < g_status_pad; i++) r[n + i] = 0;
+  n = (uint8_t)(n + g_status_pad);
+  if (usb_sof_alive()) usbMIDI.sendSysEx(n, r, false);   // core wraps F0 .. F7
 }
 // 7-bit pack/unpack (SuperOS midi.cpp scheme): each group of up to 7 raw bytes
 // goes out as 1 MSB-bitmap byte + 7 low-7-bit bytes. 192 raw -> 220 wire bytes.
@@ -739,11 +798,11 @@ static void usb_send_ram_block(uint8_t blk) {
   uint8_t r[3 + PATT_WIRE_LEN];
   r[0] = 0x7D; r[1] = 0x47; r[2] = blk;
   const uint16_t wl = pack7(&H.ext[(uint16_t)blk * PATT_BLK_LEN], PATT_BLK_LEN, r + 3);
-  usbMIDI.sendSysEx((uint16_t)(3 + wl), r, false);
+  if (usb_sof_alive()) usbMIDI.sendSysEx((uint16_t)(3 + wl), r, false);
 }
 static void usb_ram_ack(uint8_t blk, uint8_t status) {
   const uint8_t r[4] = { 0x7D, 0x48, blk, status };
-  usbMIDI.sendSysEx(4, r, false);
+  if (usb_sof_alive()) usbMIDI.sendSysEx(4, r, false);
 }
 static void usb_sysex_msg(const uint8_t *data, unsigned int sz) {
   if (sz < 4 || data[0] != 0xF0 || data[sz - 1] != 0xF7) return;
@@ -751,13 +810,17 @@ static void usb_sysex_msg(const uint8_t *data, unsigned int sz) {
   const unsigned n = sz - 2;
   if (p[0] != 0x7D || n < 2) return;
   switch (p[1]) {
-  case 0x40: usb_send_status(); break;
+  case 0x40:
+    // p[2] is the optional pad count; n counts p[0..] so n >= 3 means present.
+    g_status_pad = (n >= 3 && p[2] <= 32) ? p[2] : 0;
+    usb_send_status();
+    break;
 #ifdef D650_ROM_IN_RAM
   case 0x36: {   // web editor: mask-ROM status query -> 0x37 reply
     const uint8_t st = s_rom_valid
       ? ((eeprom_read_byte(EE_ROM_MAGIC) == EE_ROM_MAGIC_VAL) ? 1 : 2) : 0;
     const uint8_t r[3] = { 0x7D, 0x37, st };
-    usbMIDI.sendSysEx(3, r, false);
+    if (usb_sof_alive()) usbMIDI.sendSysEx(3, r, false);
     break;
   }
 #endif
@@ -1207,10 +1270,12 @@ void loop() {
 
   // stall telemetry: gap since the previous pass entered
   static uint32_t s_prev_entry_us = 0;
-  if (s_prev_entry_us) {
+  static uint8_t  s_skip_gap = 0;   // claim-091, set when the previous pass answered 0x40
+  if (s_prev_entry_us && !s_skip_gap) {
     const uint32_t gap = now - s_prev_entry_us;
     if (gap > g_max_gap_us) g_max_gap_us = gap;
   }
+  s_skip_gap = 0;
   s_prev_entry_us = now;
 
 #ifdef EMU_USB_DIAG
@@ -1533,9 +1598,17 @@ void loop() {
     for (uint8_t i = 0; i < 4; i++) { g_sec_ms_per_s[i] = (uint16_t)(g_sec_us[i] / 1000); g_sec_us[i] = 0; }
   }
 
-  // stall telemetry: how long this pass took
+  // stall telemetry: how long this pass took. claim-091: a pass that answered
+  // 0x40 cleared the window at build_status_reply and would then record its own
+  // duration into it, guaranteeing the probe's reply is the first sample every
+  // time. Skip it here, at the RECORD -- clearing inside the handler cannot fix
+  // it, because the record is further down the same pass. Cost of the fix,
+  // stated because it is real: a genuine stall landing in the same pass as a
+  // probe is now invisible, and probe passes are excluded from max_pass
+  // entirely.
   const uint32_t pass_us = micros() - now;
-  if (pass_us > g_max_pass_us) g_max_pass_us = pass_us;
+  if (g_probe_pass) { g_probe_pass = 0; s_skip_gap = 1; }
+  else if (pass_us > g_max_pass_us) g_max_pass_us = pass_us;
 
 #ifdef EMU_USB_DIAG
   // 1 Hz telemetry over USB serial. Expected on healthy hardware:

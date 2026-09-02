@@ -69,7 +69,10 @@ static uint8_t g_fw = FW_SUPEROS;
 // at each boot milestone, read back over ISP when the unit wedges. Remove
 // when the investigation concludes. 0xA1/2/3 = SuperOS stages, 0xB1/2/3 =
 // D650C stages (1 = setup entered, 2 = firmware setup done, 3 = loop ran).
-#define EE_BOOT_CRUMB ((uint8_t *)0x0FF0)
+// The four names now come from combined.h's map, where they are integer offsets
+// with an assert against EE_DIAG_LEN. They were defined here as EE_DIAG_BASE+0..3
+// while the length lived in the other file, so the two could drift with the
+// region assert still passing.
 
 void setup() {
   MCUSR = 0;
@@ -92,14 +95,22 @@ void setup() {
   g_fw = (sel == FW_D650) ? FW_D650 : FW_SUPEROS;
   // TEMP wedge diagnostics: boot counter; WDT-recovery counter via the reset
   // cause the bootloader stashes in GPIOR1 before clearing MCUSR.
-  eeprom_update_byte((uint8_t *)0x0FF2,
-                     (uint8_t)(eeprom_read_byte((uint8_t *)0x0FF2) + 1));
+  eeprom_update_byte(EE_BOOT_COUNT,
+                     (uint8_t)(eeprom_read_byte(EE_BOOT_COUNT) + 1));
   if (GPIOR1 & (1 << WDRF))
-    eeprom_update_byte((uint8_t *)0x0FF3,
-                       (uint8_t)(eeprom_read_byte((uint8_t *)0x0FF3) + 1));
+    eeprom_update_byte(EE_WDT_COUNT,
+                       (uint8_t)(eeprom_read_byte(EE_WDT_COUNT) + 1));
   eeprom_update_byte(EE_BOOT_CRUMB, g_fw == FW_D650 ? 0xB1 : 0xA1);
   if (g_fw == FW_D650) emu_setup(); else superos_setup();
   eeprom_update_byte(EE_BOOT_CRUMB, g_fw == FW_D650 ? 0xB2 : 0xA2);
+#ifdef SUPEROS_USB_MIDI
+  // VBUS gate (usb_sof.h): usb_init ran pre-main with the engine live; park
+  // it detached+frozen, then let the gate attach it right back if a cable is
+  // already present. Unplugged, the USB engine clock never runs.
+  UDCON  |= _BV(DETACH);
+  USBCON |= _BV(FRZCLK);
+  usb_vbus_gate();
+#endif
 }
 
 void loop() {
@@ -111,13 +122,25 @@ void loop() {
     s_first = false;
     eeprom_update_byte(EE_BOOT_CRUMB, g_fw == FW_D650 ? 0xB3 : 0xA3);
   }
-  // TEMP liveness heartbeat (wedge investigation): seconds-since-boot at
-  // 0x0FF1, 1 Hz. Remove with the breadcrumbs.
-  static uint32_t s_hb_ms = 0;
-  if (millis() - s_hb_ms >= 1000) {
-    s_hb_ms = millis();
-    eeprom_update_byte((uint8_t *)0x0FF1, (uint8_t)(millis() / 1000));
-  }
+  // The 1 Hz EEPROM liveness heartbeat that used to live here is REMOVED.
+  // It wrote EE_HEARTBEAT once a second forever: ~28 h of uptime against the
+  // cell's ~100k rated write cycles. Rate-limiting would not have saved it,
+  // because the defect is not the rate. ITS FAILURE MODE IS THE VALUE
+  // FREEZING, which is bit-for-bit the signature of the dead main loop it
+  // existed to detect -- so a worn-out cell and the fault it watches for read
+  // identically, and the instrument cannot distinguish the thing it measures
+  // from its own death.
+  // The per-BOOT crumbs and counters stay: they write a handful of times per
+  // power cycle, not 3600 times an hour, and claim-086's decisive instruments
+  // are EE_BOOT_COUNT and EE_WDT_COUNT, not this. EE_HEARTBEAT stays reserved
+  // in the map so nothing else claims a byte that old units still write.
+  // Liveness is now readable over the wire instead: SysEx 0x56 -> 0x57
+  // (midi.cpp). NOT 0x4E: that byte is the fleet's shared ADDRESSED
+  // ENVELOPE (claim-078) and the read was moved off it before it ever
+  // reached hardware.
+#ifdef SUPEROS_USB_MIDI
+  usb_vbus_gate();   // engine runs only while a USB-C cable is present
+#endif
   if (g_fw == FW_D650) emu_loop(); else superos_loop();
 }
 

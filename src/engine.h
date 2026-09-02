@@ -102,6 +102,10 @@ struct Engine {
 
   bool slide_dac_ = false; // slide CV for the current step (set in Advance)
   bool slide_gate = false;
+  // Ratchet for the current step, latched in Advance() like slide_dac_:
+  // 0 = none, 2 = two hits, 3 = three hits. Only a plain detached NOTE
+  // ratchets; see the latch in Advance() for the suppression rules.
+  uint8_t rat_count_ = 0;
   bool stale = false;
   uint32_t saved_hash_[NUM_PATTERNS] = {}; // per-pattern content hash at last save/load (dirty detection)
   bool resting = false;
@@ -464,6 +468,117 @@ struct Engine {
     prob_stale_ = true;
     shadow_dirty_ms_ = millis();
   }
+  // --- Ratchet accessors -----------------------------------------------------
+  // Ratchet is now PATTERN data (Sequence::ratchet[]), not probability data.
+  // Edits target the edit sequence; playback reads the playing sequence.
+  uint8_t ratchet_at(uint8_t step) const {
+    return edit_seq_view().ratchet_of(step);
+  }
+  void set_ratchet_at(uint8_t step, uint8_t count) {
+    get_edit_sequence().set_ratchet_of(step, count);
+    stale = true;
+  }
+  // Panel gesture: off -> 2x -> 3x -> off.
+  uint8_t cycle_ratchet_at(uint8_t step) {
+    const uint8_t cur = ratchet_at(step);
+    const uint8_t nxt = (cur == 0) ? 2 : (cur == 2) ? 3 : 0;
+    set_ratchet_at(step, nxt);
+    return nxt;
+  }
+  // --- Permutations must carry the probability table (claim-073) -------------
+  // A permutation moves a step's time cell and its pitch; the 3 prob bytes are
+  // the third thing keyed by step index and must move with them. Otherwise the
+  // note's accent/slide FLAGS (pitch bits 6/7, which do travel) separate from
+  // the levels that override them at playback.
+  // Guarded: prob_var1_ is p_select's resident table, so it must not be touched
+  // when the edit target is a shadow (var2/3 carry no probability) or when the
+  // A/B pin aims the edit at a different slot.
+  bool prob_follows_edit() const {
+    return edit_var_ == 0 && get_edit_patsel() == p_select;
+  }
+  // Rotating the table by one STEP is rotating the byte array by 3. Hand-rolled
+  // byte loops, not memmove: memmove is not otherwise linked into this image.
+  __attribute__((noinline)) void prob_rotate(uint8_t len, bool left) {
+    if (!prob_follows_edit() || len < 2) return;
+    const uint8_t n = uint8_t(len * 3);
+    if (left) {
+      const uint8_t t0 = prob_var1_[0], t1 = prob_var1_[1], t2 = prob_var1_[2];
+      for (uint8_t i = 0; uint8_t(i + 3) < n; ++i) prob_var1_[i] = prob_var1_[i + 3];
+      prob_var1_[n - 3] = t0; prob_var1_[n - 2] = t1; prob_var1_[n - 1] = t2;
+    } else {
+      const uint8_t t0 = prob_var1_[n - 3], t1 = prob_var1_[n - 2], t2 = prob_var1_[n - 1];
+      for (uint8_t i = uint8_t(n - 1); i >= 3; --i) prob_var1_[i] = prob_var1_[i - 3];
+      prob_var1_[0] = t0; prob_var1_[1] = t1; prob_var1_[2] = t2;
+    }
+    prob_stale_ = true;
+  }
+  __attribute__((noinline)) void prob_reverse(uint8_t len) {
+    if (!prob_follows_edit() || len < 2) return;
+    for (uint8_t i = 0, j = uint8_t(len - 1); i < j; ++i, --j)
+      for (uint8_t k = 0; k < 3; ++k) {
+        const uint8_t t = prob_var1_[i * 3 + k];
+        prob_var1_[i * 3 + k] = prob_var1_[j * 3 + k];
+        prob_var1_[j * 3 + k] = t;
+      }
+    prob_stale_ = true;
+  }
+
+  // --- Regeneration must CLEAR the probability table (claim-082) -------------
+  // The claim-073 asymmetry, and one helper cannot serve both: a PERMUTATION
+  // moves steps, so the table travels with them; a RANDOMIZE destroys them, so
+  // the table has nothing left to follow. Left behind, the old arming sits under
+  // a brand new note and a step the user never armed comes back armed.
+  //
+  // Cleared WHOLESALE, not pruned to the steps the new stream turned off.
+  // Pruning would leave the survivors determined by the pattern's PRIOR state,
+  // and CORE's claim-014 ruling requires an edit to be a total function of its
+  // own payload. A606 reached the same conclusion on the 606 from the same
+  // ruling, by a different route.
+  //
+  // Scope is the WHOLE table, all MAX_STEPS steps, NOT the pattern's `length`.
+  // I shipped the length-scoped version first and the DEVICE refuted it
+  // (wire_claim082_303.py C2/C3): 0x2B arms any step 0..31 regardless of length,
+  // so a step armed past the last step survived the randomize and came back the
+  // moment the pattern was lengthened. The host suite missed it because every
+  // check armed inside `length`.
+  //
+  // The rule that decides it is CORE's claim-014 ruling, not the retention
+  // analogy I reasoned from. Length-scoped, the resulting table depends on the
+  // pattern's prior LENGTH and prior contents; wholesale, it is always all-zero,
+  // which is trivially a total function of the payload. Time and pitch past the
+  // last step ARE retained on purpose (shorten-then-lengthen restores notes),
+  // but that is a feature of the note streams and does not extend to an
+  // override table whose contract is reproducibility.
+  //
+  // The target MAY BE NON-RESIDENT, which is the whole difficulty. `prob_var1_`
+  // is only ever p_select's table, so reusing prob_follows_edit() here would
+  // skip the clear for exactly the case a host 0x2E exercises. A non-resident
+  // slot goes through the one-slot scratch, the route SysEx 0x27 uses for poly.
+  void prob_clear_for_randomize(uint8_t pat) {
+    const uint8_t n = uint8_t(FB_PROB_LEN);
+    if (pat == p_select) {
+      for (uint8_t i = 0; i < n; ++i) prob_var1_[i] = 0;
+      prob_stale_       = true;
+      shadow_dirty_ms_  = millis();
+      return;
+    }
+    // Operates on the prob_edit_ MEMBER, not a local. The obvious spelling here
+    // is export_prob_table() into a uint8_t[FB_PROB_LEN] local, zero it, and
+    // hand it to prob_edit_blob(); that puts 96 B on the stack underneath
+    // handle_sysex, which is claim-072's shape exactly (save_dirty holding
+    // buf[243] across a gc()) and A808's claim-080 is the fleet paying for it.
+    // The scratch already exists and is already the right size.
+    const uint8_t s = abs_slot(pat);
+    if (prob_edit_slot_ != int16_t(s)) {
+      flush_prob_edit();
+      ReadProbAt(s, prob_edit_);
+      prob_edit_slot_ = int16_t(s);
+    }
+    for (uint8_t i = 0; i < n; ++i) prob_edit_[i] = 0;
+    prob_edit_dirty_ = true;
+    prob_edit_ms_    = millis();
+  }
+
   // Random level for a randomize op: ~1/3 of steps unarmed (0), else 1..13.
   static uint8_t prob_rand_level() {
     return fast_rand(3) ? uint8_t(1 + fast_rand(PROB_LEVEL_MAX)) : 0;
@@ -856,6 +971,18 @@ struct Engine {
                                : get_sequence().get_slide();
       slide_gate = (!next_is_rest && cur_slide) || next_is_tie || tie_slide;
     }
+    // Ratchet latch. Only a plain detached NOTE retriggers: never a TIE (the
+    // held note must not chop), never a slide destination (a retrigger kills
+    // the glide arriving here), and never a note whose gate extends onward
+    // (slide_gate covers this step sliding out, tying onward, and a prob-forced
+    // slide alike). Ratchet is pattern data (Sequence::ratchet_of) but its
+    // playback is gated by these suppression rules.
+    rat_count_ = 0;
+    if (result && !get_sequence().is_tie() && !slide_dac_ && !slide_gate) {
+      const uint8_t k = uint8_t(get_sequence().time_pos) & (MAX_STEPS - 1);
+      const uint8_t rc = get_sequence().ratchet_of(k);
+      if (rc >= 2) rat_count_ = rc;
+    }
     resting = !result;
     return result;
   }
@@ -898,6 +1025,7 @@ struct Engine {
     clk_count = -1;
     slide_dac_ = false;
     slide_gate = false;
+    rat_count_ = 0;
     resting = true;
     advance_count_ = 0;
     pp_dir_ = 1;
@@ -919,24 +1047,63 @@ struct Engine {
 
   /// Randomize entire pattern: random time + random pitches in stream order.
   void RandomizeFullPattern() {
-    Sequence &s = get_edit_sequence();
-    const uint8_t len = s.length;
-    fast_rand_seed();
-    uint8_t prev = 1;
-    for (uint8_t i = 0; i < len; i++) {
-      const uint8_t t = fast_rand_time_weighted(prev, i == 0);
-      sequence_set_time_at(s, i, t);
-      prev = t;
+    RandomizePattern(get_edit_sequence(), RAND_DENSITY_WEIGHTED, 0, RND_TIME_AND_PITCH);
+    // claim-082. The PANEL path takes the opposite guard to HostRandomize: the
+    // target is whatever get_edit_sequence() resolves to, which may be a var2/3
+    // shadow (those carry no probability at all) or an A/B-pinned other slot,
+    // so prob_var1_ must not be touched unless the edit really does follow it.
+    if (prob_follows_edit())
+      prob_clear_for_randomize(p_select);
+  }
+
+  /// The body of all three panel randomizers and of SysEx 0x15 scope 0/1
+  /// (claim-014). One function because they differ only at the edges: the time
+  /// loop, and what happens to the pitch stream afterwards.
+  ///
+  /// Explicit target so the host can reach a pattern that is not the edit slot.
+  /// seed != 0 must reproduce the pattern byte for byte, so it is applied HERE
+  /// rather than through a global: fast_rand_seed() would immediately overwrite
+  /// it with micros(). noinline because each caller inlining this body cost
+  /// 744 B on a build with 92 B between the app and the flash arena.
+  __attribute__((noinline))
+  void RandomizePattern(Sequence &s, uint8_t density, uint16_t seed, uint8_t mode) {
+    if (seed) s_fast_rng = seed; else fast_rand_seed();
+    if (mode != RND_PITCH_ONLY) {
+      // Regenerating the time stream discards ratchets (they are step-keyed
+      // pattern data now); randomize never creates one.
+      for (uint8_t i = 0; i < MAX_STEPS / 4; ++i) s.ratchet[i] = 0;
+      const uint8_t len = s.length;
+      uint8_t prev = 1;
+      for (uint8_t i = 0; i < len; i++) {
+        const uint8_t t = fast_rand_time_density(prev, i == 0, density);
+        sequence_set_time_at(s, i, t);
+        prev = t;
+      }
+      if (mode == RND_TIME_ONLY) {
+        // Existing pitches keep their stream order; the stream auto-extends only
+        // if the new NOTE count outgrew it.
+        sequence_ensure_pitch_for_notes(s);
+        stale = true;
+        return;
+      }
     }
-    normalize_pattern_times_only(s);
-    const uint8_t nc = s.note_count();
-    for (uint8_t k = 0; k < nc; ++k) {
-      s.pitch[k] = s.scale_apply_packed(fast_rand_pitch_byte_weighted())
-                   | fast_rand_accent_weighted()
-                   | fast_rand_slide_weighted();
+    const bool with_times = (mode == RND_TIME_AND_PITCH);
+    // One pitch per NOTE event when the time stream was just generated. Pitch-only
+    // walks pitch_count instead, which keeps pitches queued past the note count
+    // (the two-stream semantic: removing a NOTE leaves its pitch in the stream).
+    const uint8_t pc = with_times ? s.note_count() : s.get_pitch_count();
+    for (uint8_t k = 0; k < pc; ++k) {
+      // Three PRNG draws, sequenced (claim-055): `|` does not order its
+      // operands, so as one expression the pattern a seed produced was a
+      // property of the compiler. See fast_rand_pitch_byte_weighted.
+      const uint8_t p6  = s.scale_apply_packed(fast_rand_pitch_byte_weighted());
+      const uint8_t acc = fast_rand_accent_weighted();
+      s.pitch[k] = p6 | acc | fast_rand_slide_weighted();
     }
-    for (uint8_t k = nc; k < MAX_STEPS; ++k) s.pitch[k] = PITCH_EMPTY;
-    s.set_pitch_count(nc);
+    if (with_times) {
+      for (uint8_t k = pc; k < MAX_STEPS; ++k) s.pitch[k] = PITCH_EMPTY;
+      s.set_pitch_count(pc);
+    }
     stale = true;
   }
 
@@ -950,8 +1117,10 @@ struct Engine {
     for (uint8_t i = 0; i < len - 1; ++i)
       sequence_set_time_at(s, i, s.time(uint8_t(i + 1)));
     sequence_set_time_at(s, len - 1, ft);
-    normalize_pattern_times_only(s);
+    // No normalize: a permutation must not promote a step-0 TIE (claim-031).
     sequence_ensure_pitch_for_notes(s);
+    prob_rotate(len, true);   // claim-073
+    sequence_rotate_ratchet(s, len, true);  // ratchet is step-keyed pattern data
     stale = true;
   }
 
@@ -963,39 +1132,46 @@ struct Engine {
     for (int i = int(len - 1); i > 0; --i)
       sequence_set_time_at(s, uint8_t(i), s.time(uint8_t(i - 1)));
     sequence_set_time_at(s, 0, lt);
-    normalize_pattern_times_only(s);
+    // No normalize: a permutation must not promote a step-0 TIE (claim-031).
     sequence_ensure_pitch_for_notes(s);
+    prob_rotate(len, false);  // claim-073
+    sequence_rotate_ratchet(s, len, false);  // ratchet is step-keyed pattern data
     stale = true;
   }
 
   /// Randomize pitches only - keeps time data; per-NOTE-slot random pitch.
-  void RandomizePitchData() {
-    Sequence &s = get_edit_sequence();
-    const uint8_t pc = s.get_pitch_count();
-    fast_rand_seed();
-    for (uint8_t k = 0; k < pc; ++k) {
-      s.pitch[k] = s.scale_apply_packed(fast_rand_pitch_byte_weighted())
-                   | fast_rand_accent_weighted()
-                   | fast_rand_slide_weighted();
-    }
-    stale = true;
+  void RandomizePitchData() { RandomizePattern(get_edit_sequence(), 0, 0, RND_PITCH_ONLY); }
+
+  /// SysEx 0x15 RANDOMIZE (claim-014), whole dispatch. Returns the 0x14 ack
+  /// status: 0 ok, 2 out of range. It lives here, not in midi.cpp, because the
+  /// PRNG helpers in sequence.h are `static inline`: a call from midi.cpp gives
+  /// that TU its own copy of fast_rand and every weighted helper, which this
+  /// build has no flash for.
+  // claim-014 RANDOMIZE, payload [pat, lane, density, seed_lo, seed_hi].
+  // `lane` replaced `scope` in CORE's claim-057 ruling: an edit opcode must be a
+  // total function of its own payload, and `scope` meant different things on
+  // different machines. 0x7F = every lane. The 303 is a mono synth with NO
+  // lanes, so the contract's rule for that case applies verbatim: accept 0x7F
+  // and lane 0, reject everything else with ack 2 rather than silently widening
+  // to the whole pattern (the 606 bug the ruling was written against).
+  // NOTE this DROPS the old `scope 1 = pitch only`. It is not in the contract,
+  // and lane 1 now means "lane index 1", which this machine does not have.
+  uint8_t HostRandomize(uint8_t pat, uint8_t lane, uint8_t density, uint16_t seed) {
+    if (pat >= NUM_PATTERNS) return 2;
+    if (lane != 0x7F && lane != 0) return 2;
+    RandomizePattern(pattern[pat], density, seed, RND_TIME_AND_PITCH);
+    // claim-082. The slot is named by the payload, so it is var1 by
+    // construction and may be non-resident; prob_follows_edit() is the WRONG
+    // guard here and would skip exactly this case. Ordered after the generator
+    // so a rejected payload (the returns above) changes nothing at all.
+    prob_clear_for_randomize(pat);
+    return 0;
   }
 
   /// Randomize time data only. Existing pitches are preserved in stream order;
   /// pitch_count auto-extends if the new note_count exceeds it.
   void RandomizeTimeData() {
-    Sequence &s = get_edit_sequence();
-    const uint8_t len = s.length;
-    fast_rand_seed();
-    uint8_t prev = 1;
-    for (uint8_t i = 0; i < len; i++) {
-      const uint8_t t = fast_rand_time_weighted(prev, i == 0);
-      sequence_set_time_at(s, i, t);
-      prev = t;
-    }
-    normalize_pattern_times_only(s);
-    sequence_ensure_pitch_for_notes(s);
-    stale = true;
+    RandomizePattern(get_edit_sequence(), RAND_DENSITY_WEIGHTED, 0, RND_TIME_ONLY);
   }
 
   void RandomizeAccentData() {
@@ -1109,8 +1285,10 @@ struct Engine {
     }
     sequence_set_time_at(s, uint8_t(len - 1), ft);
     per_time[len - 1] = fp;
-    normalize_pattern_times_only(s);
+    // No normalize: a permutation must not promote a step-0 TIE (claim-031).
     sequence_unpack_per_time(s, per_time);
+    prob_rotate(len, true);   // claim-073
+    sequence_rotate_ratchet(s, len, true);  // ratchet is step-keyed pattern data
     stale = true;
   }
 
@@ -1128,8 +1306,10 @@ struct Engine {
     }
     sequence_set_time_at(s, 0, lt);
     per_time[0] = lp;
-    normalize_pattern_times_only(s);
+    // No normalize: a permutation must not promote a step-0 TIE (claim-031).
     sequence_unpack_per_time(s, per_time);
+    prob_rotate(len, false);  // claim-073
+    sequence_rotate_ratchet(s, len, false);  // ratchet is step-keyed pattern data
     stale = true;
   }
 
@@ -1169,8 +1349,10 @@ struct Engine {
       per_time[i] = per_time[j];
       per_time[j] = pti;
     }
-    normalize_pattern_times_only(s);
+    // No normalize: a permutation must not promote a step-0 TIE (claim-031).
     sequence_unpack_per_time(s, per_time);
+    prob_reverse(len);        // claim-073
+    sequence_reverse_ratchet(s, len);  // ratchet is step-keyed pattern data
     stale = true;
   }
 
@@ -1242,7 +1424,12 @@ struct Engine {
     for (uint8_t k = 0; k < pc; ++k) {
       if (s.pitch[k] == PITCH_EMPTY) continue;
       const uint8_t pk_old = s.pitch[k] & 0x3F;
-      const uint8_t oct    = pk_old / 13;
+      // pack_pitch is NIBBLE packed (semi | oct << 4), stride 16. This used to
+      // be `pk_old / 13`, which is the right arithmetic for a LINEAR key index
+      // and the wrong one for this byte: it moved 18 of the 52 (semi, oct)
+      // pairs to another octave and overflowed 9 of them to octave 4, which
+      // pack_pitch then masked down to 0. claim-115.
+      const uint8_t oct    = (pk_old >> 4) & 0x03;
       const uint8_t new_k  = fast_rand(PITCH_KEY_HIGH_C + 1);
       const uint8_t pk_new = pack_pitch(new_k, oct);
       s.pitch[k] = (s.pitch[k] & 0xC0) | pk_new;
@@ -1257,7 +1444,10 @@ struct Engine {
     for (uint8_t k = 0; k < pc; ++k) {
       if (s.pitch[k] == PITCH_EMPTY) continue;
       const uint8_t pk_old = s.pitch[k] & 0x3F;
-      const uint8_t key_i  = pk_old % 13;
+      // Same stride-13 mistake as RandomizeSemitones above, mirrored: `pk_old
+      // % 13` recovered the key for only 13 of the 52 pairs, so an OCTAVE
+      // randomize transposed every note above octave 0. claim-115.
+      const uint8_t key_i  = pk_old & 0x0F;
       const uint8_t new_o  = fast_rand(4);
       s.pitch[k] = (s.pitch[k] & 0xC0) | pack_pitch(key_i, new_o);
     }
@@ -1374,9 +1564,17 @@ struct Engine {
   // triplets (clk_count < 4 of 8).
   bool get_gate() const {
     if (resting) return false;
-    const uint8_t half = uint8_t(step_period() >> 1);
+    const uint8_t period = step_period();
+    const uint8_t half = uint8_t(period >> 1);
     if (get_slide_dac()) return slide_gate ? true : (clk_count < int8_t(half));
     if (slide_gate) return true;
+    // Ratchet sub-trigger windows (rat_count_ only latches on a plain detached
+    // NOTE -- the slide/tie paths above suppress it). Integer-tick spacing is
+    // exact for both hit counts on 6-tick 16ths (hits at 0/3 and 0/2/4); on
+    // 8-tick triplets 2x is exact (0/4) and 3x lands 0/3/6 with 2-tick gates.
+    if (rat_count_ == 2) return (clk_count % int8_t(half)) < int8_t(half - 1);
+    if (rat_count_ == 3) return (period == 6) ? ((clk_count & 1) == 0)
+                                              : ((clk_count % 3) < 2);
     return clk_count < int8_t(half);
   }
 
@@ -1433,7 +1631,8 @@ struct Engine {
     if (override) p_select = next_p;
     edit_var_ = 0; // a new pattern always starts on variation 1 for editing
   }
-  // Canonical length change: clamps to the triplet cap (48) or MAX_STEPS and
+  // Canonical length change: clamps to the triplet cap (TRIPLET_MAX_STEPS, 24
+  // at MAX_STEPS = 32) or MAX_STEPS and
   // rebuilds pitch_count (NOTE events outside the new length no longer count).
   // NON-VOLATILE both ways (spec 5): time_data and pitch[] past the new last
   // step are kept, so shortening then re-lengthening restores the original
@@ -1547,6 +1746,15 @@ struct Engine {
   /// On TIE step: write the held source NOTE's slot (pitch_pos).
   /// On NOTE step: write the current NOTE's slot (pitch_pos).
   void midi_apply_note_on(uint8_t note, uint8_t velocity) {
+    // claim-099: MIDI note entry is the PANEL's pitch-write path reached over
+    // the wire, so it obeys the panel's gate. Without this a note-on from ANY
+    // source overwrote pitch[pitch_pos] in EVERY mode and set stale, so a
+    // person playing a keyboard into a stopped 303 lost the note under the
+    // cursor and gained an accent from velocity >= 100. That is claim-079's
+    // firmware half: closing it in the bench tool never made it impossible.
+    // PITCH_MODE is only enterable from Pattern Write (main.cpp:3677); the
+    // poly chord editor is PITCH_MODE too and edits the chord stream, not this.
+    if (mode_ != PITCH_MODE || in_poly_pitch_edit()) return;
     if (note < 36 || note > 36 + 48) return;
     uint8_t lin = uint8_t(note - 36);
     if (lin > 48) lin = 48;

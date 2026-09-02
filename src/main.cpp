@@ -33,6 +33,10 @@ PersistentSettings GlobalSettings;
 // =============================================================================
 static uint8_t clk_count = 0;
 static uint8_t transpose = 12; // global performance transpose, 0..47 (12 = no transpose)
+// Live transpose queued while running: PITCH+key edits land here and apply on
+// the next pattern wrap (first step), not mid-pattern. 0xFF = nothing queued.
+// Reset (with `transpose`) on pattern switch in play modes.
+static uint8_t s_transpose_queued = 0xFF;
 // Effective transpose = global performance + per-pattern transpose (-24..+24) + track
 // step. Signed so per-pattern down-transpose can pull the note below the baseline.
 static int16_t total_transpose = 12;
@@ -76,6 +80,17 @@ static uint8_t s_tap_pitch_preview_retrig = 0; // ticks to force gate low for en
 static bool s_back_pitch_preview_gate = false;
 static uint8_t s_back_pitch_preview_cv = 0;
 
+// Ratchet audition: stepping onto a ratcheted step in TIME MODE re-strikes the
+// preview note rat_count times (2x/3x) so the ratchet is audible while stopped.
+// The first hit is the normal step preview; these are the remaining re-strikes,
+// spaced by a fixed gap (there is no clock to divide while stopped). Cancels
+// automatically when the preview gate closes (TAP release), so no stuck notes.
+static uint8_t  s_rat_aud_hits = 0;
+static uint32_t s_rat_aud_next_ms = 0;
+static uint8_t  s_rat_aud_note = 0;
+static uint8_t  s_rat_aud_vel = 0;
+static constexpr uint8_t RAT_AUD_GAP_MS = 50;
+
 static elapsedMillis pattern_cleared_flash_timer;
 static constexpr uint16_t PATTERN_CLEARED_FLASH_MS = 400;
 // Holds the flash LEDs lit until CLEAR is released after a pattern-clear action,
@@ -106,7 +121,7 @@ static bool s_metro_press_pending               = false;  // TAP press awaiting 
 static bool s_metro_note_active                 = false;  // tapped note's finger still down (tie source)
 static bool s_metro_any_note                    = false;  // sustain tie-fill arms after the first note
 static bool s_metro_pass_accept                 = false;  // a tap was HELD at its accept tick this pass
-static bool s_metro_bar_started                 = false;  // bar reset reached step 0; writes enabled
+static bool s_metro_bar_started                 = false;  // session's bar-1 wrap landed; writes enabled
 static bool s_metro_step_prewritten             = false;  // upcoming step already holds a next-step NOTE
 // Two per-pattern phases while the session runs. RECORD = the ROM's measure
 // (clicks on, engine voice silent, monitor under the finger), looping until
@@ -140,6 +155,14 @@ static elapsedMillis s_metro_gate_timer;
 
 // Direction mode (FN + TIME_KEY)
 static bool s_dir_mode = false;
+
+// The submode that was live when FUNCTION was PRESSED (claim-103). FN rising
+// drops PITCH/TIME back to NORMAL (below), which is correct and documented --
+// but it also destroyed the only evidence that FN+UP was meant to toggle
+// TRIPLET "in TIME MODE", because holding FN is what ends TIME MODE. Latching
+// it here keeps both behaviours: FN still exits, and the FN+UP branch can still
+// see which submode the gesture STARTED in.
+static SequencerMode s_fn_entry_mode = NORMAL_MODE;
 
 // Keyboard play mode (FN + PITCH_KEY toggle while dial is in Pattern Play).
 // Pitched keys play the 303 voice live (DAC override) without modifying the
@@ -346,9 +369,39 @@ static void emit_chain_state() {
 }
 
 // (Re)start a tap-write session. ROM entry semantics: clear the time data,
-// BAR RESET (session starts at step 0, like the d650c's CLEAR-while-running),
 // start the metronome. Pitch streams are preserved so tapped NOTEs consume
 // the user's pitches in stream order.
+// TIMING: the session start is DEFERRED to the pattern's own next wrap -- the
+// take's bar 1 is the pattern's "1", never the gesture instant. The d650c ROM
+// can bar-reset at entry because its bar IS its timebase; here the clock free
+// runs, so an entry-time Engine::Reset() re-anchored step 0 to whatever 24ppqn
+// tick the gesture landed on (0-5 ticks into a step, anywhere in the bar),
+// shifting the whole grid off the beat by a different amount every gesture.
+// Until the wrap lands, the pattern keeps its phase, the clicks tick in phase
+// on the 8ths (a natural count-in), and writes stay disabled
+// (s_metro_bar_started).
+// Aim the next wrap at the session start (chain member 0 / a linked pair's A
+// section / the current pattern). Called at entry and re-called every loop
+// iteration while the start is pending, overriding the chain advance and the
+// A/B alternation (which would hand the wrap to the next member or B half).
+// Wipe a pattern's time stream (pitch stream kept) and re-sync the web editor.
+__attribute__((noinline)) static void metro_wipe_time(uint8_t p) {
+  Sequence &ws = engine.pattern[p];
+  for (uint8_t i = 0; i < ws.length; ++i) sequence_set_time_at(ws, i, 0);
+  engine.stale = true;
+  midi_send_pattern_update(p);
+}
+__attribute__((noinline)) static void metro_queue_session_start() {
+  if (s_chain_active && s_chain_len > 1) {
+    // Park the cursor at the end so the chain advance also queues pats[0]:
+    // the wrap's value-search then resolves the cursor to 0.
+    s_chain_pos = uint8_t(s_chain_len - 1);
+    engine.SetPattern(chain_entry_start(s_chain_pats[0]));
+  } else {
+    engine.SetPattern(s_ab_mode ? Engine::section_a_of(engine.get_patsel())
+                                : engine.get_patsel());
+  }
+}
 // The session's UNIT is everything the playhead will traverse: the entry
 // section, the other half of a linked pair, and every member of an active
 // chain (plus their linked halves). The WHOLE unit is wiped to RECORD --
@@ -368,22 +421,14 @@ static void metro_session_begin() {
   // simultaneous-press note at the gesture); the session runs in NORMAL.
   engine.SetMode(NORMAL_MODE, false);
   const bool chain_session = s_chain_active && s_chain_len > 1;
-  if (chain_session) {
-    s_chain_pos       = 0;
-    s_chain_queue_len = 0;
-    chain_intent_reset();
-    engine.SetPattern(chain_entry_start(s_chain_pats[0]), true);
-    emit_chain_state();
-  } else {
-    // Pin the engine to the session start: a pattern switch queued before
-    // the gesture (quick tap / parked pair defer) must not yank the session
-    // to an un-wiped pattern at the bar-1 wrap.
-    chain_intent_reset();
-    engine.SetPattern(s_ab_mode
-                          ? Engine::section_a_of(engine.get_patsel())
-                          : engine.get_patsel(),
-                      true);
-  }
+  // Queue (not force) the session start: a pattern switch queued before the
+  // gesture (quick tap / parked pair defer) must not yank the session to an
+  // un-wiped pattern at the bar-1 wrap. The pending-start steering in loop()
+  // re-queues this every iteration until the wrap lands.
+  s_chain_queue_len = 0;
+  chain_intent_reset();
+  metro_queue_session_start();
+  if (chain_session) emit_chain_state();
   uint16_t wipe = 0;
   uint8_t  pass_bars = 0;   // bars in one full traversal (linked halves count)
   if (chain_session) {
@@ -408,16 +453,13 @@ static void metro_session_begin() {
       pass_bars = 2;
     }
   }
-  for (uint8_t p = 0; p < NUM_PATTERNS; ++p) {
-    if (!(wipe & uint16_t(1u << p))) continue;
-    Sequence &ws = engine.pattern[p];
-    for (uint8_t i = 0; i < ws.length; ++i) sequence_set_time_at(ws, i, 0);
-    midi_send_pattern_update(p);
-  }
+  for (uint8_t p = 0; p < NUM_PATTERNS; ++p)
+    if (wipe & uint16_t(1u << p)) metro_wipe_time(p);
   s_metro_unit_mask = wipe;
   s_metro_pass_bars = pass_bars ? pass_bars : 1;
   s_metro_bar_count = 0;
-  engine.Reset();                       // bar reset: next tick = step 0
+  // NO engine.Reset() here: the clock phase must survive the gesture. The
+  // session's bar 1 is the next natural tp==0 wrap (s_metro_bar_started).
   s_metro_prev_pat        = engine.get_patsel();
   s_metro_tail_cv         = 63;   // idle tail starts at the click pitch
   s_metro_step_tick       = 0;
@@ -431,8 +473,7 @@ static void metro_session_begin() {
   s_metro_gate_pulse      = false;
   s_metro_gate_ticks      = 0;
   s_metro_record_phase    = true;
-  s_metro_recorded_mask   = 0;
-  engine.stale = true;   // wiped patterns re-sent in the wipe loop above
+  s_metro_recorded_mask   = 0;  // stale set by metro_wipe_time above
 }
 
 // Broadcast track-mode state (SysEx 0x23) for the web editor's Track view.
@@ -813,6 +854,16 @@ static void process_config_menu() {
     cfg_save_midi();
   }
 
+  // F# = SysEx on/off (RX and TX together; the web editor can set them
+  // independently via 0x22). LED lit = SysEx enabled.
+  Leds::Set(FSHARP_KEY_LED, GlobalSettings.sysex_rx_enable || GlobalSettings.sysex_tx_enable);
+  if (inputs[FSHARP_KEY].rising()) {
+    const bool en = !(GlobalSettings.sysex_rx_enable || GlobalSettings.sysex_tx_enable);
+    GlobalSettings.sysex_rx_enable = en;
+    GlobalSettings.sysex_tx_enable = en;
+    cfg_save_midi();
+  }
+
   // A# held + UP/DOWN: LED brightness 1..8
   if (inputs[ASHARP_KEY].held()) {
     Leds::Set(ASHARP_KEY_LED, true);
@@ -1042,6 +1093,16 @@ static void usb_shutdown_hw() {
 }
 #endif
 
+// SysEx 0x15 RANDOMIZE (claim-014). midi.cpp calls this thunk instead of the
+// Engine method directly: the PRNG helpers in sequence.h are `static inline`, so
+// a call from midi.cpp gives that TU its own copy of fast_rand and every weighted
+// helper (+562 B measured, on a build with 92 B between the app and the flash
+// arena). main.cpp already instantiates them for the panel's CLEAR-layer
+// randomize, so this keeps one copy.
+uint8_t engine_host_randomize(uint8_t pat, uint8_t scope, uint8_t density, uint16_t seed) {
+  return engine.HostRandomize(pat, scope, density, seed);
+}
+
 void setup() {
 #ifdef SUPEROS_COMBINED
   // Run the constructor (NSDMI defaults) over the zeroed shared arena; net
@@ -1160,9 +1221,14 @@ void PrintTime() {
   Leds::Set(DOWN_KEY_LED,   t == 1);
   Leds::Set(UP_KEY_LED,     t == 2);
   Leds::Set(ACCENT_KEY_LED, t == 0);
-  // Step-lock UI removed: it's RAM-only since the OS-303 layout migration
-  // (no EEPROM byte for it), and the SLIDE_KEY toggle here confused users.
-  Leds::Set(SLIDE_KEY_LED, false);
+  // SLIDE LED = the cursor step's ratchet: off = none, solid = 2x, blink = 3x.
+  // (The step-lock toggle that used to sit on SLIDE here is long gone.)
+  uint8_t rc = 0;
+  if (engine.prob_follows_edit()) {
+    const uint8_t tp = uint8_t(engine.edit_seq_view().time_pos & (MAX_STEPS - 1));
+    rc = engine.ratchet_at(tp);
+  }
+  Leds::Set(SLIDE_KEY_LED, rc == 2 || (rc == 3 && bool((millis() >> 7) & 1)));
 }
 
 // Light the pitch-key LED of the NOTE at the edit cursor (no octave/flag
@@ -1177,7 +1243,9 @@ static void PrintCursorNoteLed() {
 }
 
 // ---------------------------------------------------------------------------
-// ProcessDirectionMode — FN + PITCH_KEY: select playback direction
+// ProcessDirectionMode - FN + TIME_KEY: select playback direction (the entry is
+// at the `fn_mod && inputs[TIME_KEY].rising()` test below; FN + PITCH_KEY is
+// step-select, a different mode)
 // C=Forward D=Reverse E=PingPong F=Random G=HalfRand A=Brownian; FN to exit
 // ---------------------------------------------------------------------------
 static const InputIndex  kDirKeys[DIR_COUNT] = {C_KEY, D_KEY, E_KEY, F_KEY, G_KEY, A_KEY};
@@ -1214,6 +1282,38 @@ void ProcessDirectionMode(bool persist) {
 }
 
 // ---------------------------------------------------------------------------
+// Cycle the ratchet on `step` of the resident prob table (off -> 2x -> 3x ->
+// off) and mirror that step's three prob bytes to the web editor (0x2B), same
+// as probability-mode edits do. Callers guard with engine.prob_follows_edit().
+static void cycle_ratchet_and_mirror(uint8_t step) {
+  const uint8_t count = engine.cycle_ratchet_at(step);  // writes the pattern
+  midi_send_ratchet_step(engine.get_patsel(), step, count);  // 0x2E
+}
+
+// Arm a ratchet audition after a step preview has sounded its first hit.
+// rc is the step's ratchet count (2 or 3); rc < 2 disarms.
+static void arm_ratchet_audition(uint8_t rc, uint8_t note, uint8_t vel) {
+  if (rc < 2) { s_rat_aud_hits = 0; return; }
+  s_rat_aud_hits    = uint8_t(rc - 1);       // first hit already sounded
+  s_rat_aud_note    = note;
+  s_rat_aud_vel     = vel;
+  s_rat_aud_next_ms = millis() + RAT_AUD_GAP_MS;
+}
+
+// Fire the pending ratchet re-strikes on schedule. Re-strikes the CV envelope
+// (preview retrig) and the MIDI audition note. Bound to the preview gate: when
+// the gate closes (TAP release), the audition cancels with no stuck note.
+static void ServiceRatchetAudition() {
+  if (s_rat_aud_hits == 0) return;
+  if (!s_tap_pitch_preview_gate) { s_rat_aud_hits = 0; return; }
+  if (int32_t(millis() - s_rat_aud_next_ms) < 0) return;
+  s_tap_pitch_preview_retrig = 2;            // CV gate low -> re-strike
+  midi_audition_note_off();
+  midi_audition_note_on(s_rat_aud_note, s_rat_aud_vel);
+  --s_rat_aud_hits;
+  s_rat_aud_next_ms += RAT_AUD_GAP_MS;
+}
+
 // ProcessEdit — TAP_NEXT held: pitch/time edit UI
 //
 // BACK_KEY behaviour:
@@ -1245,6 +1345,12 @@ void ProcessEdit(const bool &write_mode, const bool clk_run) {
   case TIME_MODE:
     if (write_mode) {
       input_time(true, clk_run);
+      // SLIDE cycles the cursor step's ratchet (off -> 2x -> 3x -> off).
+      // Var1 resident only: the count lives in p_select's prob table. FN
+      // excluded so the FN+SLIDE probability-mode gesture never half-fires.
+      if (!inputs[FUNCTION_KEY].held() && inputs[SLIDE_KEY].rising() &&
+          engine.prob_follows_edit())
+        cycle_ratchet_and_mirror(uint8_t(engine.edit_seq_view().time_pos & (MAX_STEPS - 1)));
       PrintTime();
       PrintCursorNoteLed(); // keep the step's note visible while stepping
     }
@@ -1419,11 +1525,16 @@ void ProcessDefault(const bool &write_mode, const bool &clear_mod,
     break;
 
   case TIME_MODE:
-    // Time state + note LED stay visible in TIME_MODE whether running or
-    // stopped (stopped display previously went dark between TAP presses).
+    // Time state stays visible whether running or stopped. Stopped, the
+    // step/page display shows where the cursor sits, same as PITCH_MODE
+    // (spec 4); TAP held swaps it for the step's note (ProcessEdit owns that
+    // frame). Previously the stopped frame showed the cursor NOTE's pitch
+    // LED instead, which read as the display "iterating through the notes"
+    // rather than the steps.
     PrintTime();
-    PrintCursorNoteLed();
+    if (!clk_run) PrintPitchStepPage();
     if (clk_run) {
+      PrintCursorNoteLed();
       const uint8_t tp = engine.get_edit_time_pos();
       Leds::Set(OutputIndex(tp & 0x7), true);
       // Bank indicator disabled in live time edit (see PITCH_MODE above).
@@ -1870,24 +1981,51 @@ static bool metro_sustain_held() {
   return false;
 }
 
-// PITCH modifier: live transpose root / octave for performance
-void ProcessPitchMod() {
+// Effective transpose = global performance + per-pattern + (Track mode) the
+// per-chain-step transpose. Called once per loop pass and again when a queued
+// live transpose lands at a wrap, so the new value reaches the MIDI/DAC sends
+// of that same tick. TRACK_TRANSPOSE_ZERO (=12) means "no transpose".
+static void recompute_total_transpose() {
+  total_transpose = int16_t(int(transpose) + int(engine.get_pattern_transpose()));
+  if (engine.track_active && engine.track_has_chain()) {
+    const int8_t step_off = int8_t(engine.TrackGetTranspose(engine.get_chain_pos()))
+                          - int8_t(TRACK_TRANSPOSE_ZERO);
+    total_transpose = int16_t(int(total_transpose) + int(step_off));
+  }
+}
+
+// PITCH modifier: live transpose root / octave for performance. While the
+// sequencer runs, edits are QUEUED and land on the first step of the next
+// pattern pass (musically on the bar) instead of mid-pattern; the pitch LEDs
+// show the queued value while it waits. Stopped, edits apply immediately.
+void ProcessPitchMod(bool clk_run) {
   // Solid FUNCTION_MODE_LED so the indicator is visible while stopped (clk_count blink mask
   // would otherwise sit at 0). On release the next-frame ProcessDefault redraws normal LEDs.
   Leds::Set(FUNCTION_MODE_LED, true);
-  show_pitch_leds(pack_pitch(transpose % 12, transpose / 12));
+  const uint8_t shown = (s_transpose_queued != 0xFF) ? s_transpose_queued : transpose;
+  show_pitch_leds(pack_pitch(shown % 12, shown / 12));
 
+  uint8_t t = shown;
+  bool edited = false;
   for (uint8_t i = 0; i < ARRAY_SIZE(pitched_keys); ++i) {
-    if (inputs[pitched_keys[i]].rising())
-      transpose = (transpose / 12) * 12 + i;
+    if (inputs[pitched_keys[i]].rising()) {
+      t = uint8_t((t / 12) * 12 + i);
+      edited = true;
+    }
   }
   if (inputs[DOWN_KEY].rising()) {
-    uint8_t oct = constrain(int(transpose) / 12 - 1, 0, 3);
-    transpose = (transpose % 12) + oct * 12;
+    uint8_t oct = constrain(int(t) / 12 - 1, 0, 3);
+    t = uint8_t((t % 12) + oct * 12);
+    edited = true;
   }
   if (inputs[UP_KEY].rising()) {
-    uint8_t oct = constrain(int(transpose) / 12 + 1, 0, 3);
-    transpose = (transpose % 12) + oct * 12;
+    uint8_t oct = constrain(int(t) / 12 + 1, 0, 3);
+    t = uint8_t((t % 12) + oct * 12);
+    edited = true;
+  }
+  if (edited) {
+    if (clk_run) s_transpose_queued = t;
+    else         transpose = t;
   }
 }
 
@@ -2234,7 +2372,11 @@ static void ProcessStepSelect(bool clk_run, bool dial_pattern_write) {
             sequence_write_time_with_pitch_sync(seq, si, 0);
             engine.stale = true; tchanged = true;
           }
-          // SLIDE_KEY step-lock toggle removed (RAM-only feature).
+          // SLIDE cycles the selected step's ratchet (off -> 2x -> 3x -> off).
+          // Var1 resident only: an A/B-pinned or shadow edit target has no
+          // resident prob table, so the press is ignored there.
+          if (inputs[SLIDE_KEY].rising() && engine.prob_follows_edit())
+            cycle_ratchet_and_mirror(si);
           if (tchanged) {
             uint8_t after_pt[MAX_STEPS];
             sequence_pack_per_time(seq, after_pt);
@@ -2251,7 +2393,11 @@ static void ProcessStepSelect(bool clk_run, bool dial_pattern_write) {
         Leds::Set(DOWN_KEY_LED,   st == 1);
         Leds::Set(UP_KEY_LED,     st == 2);
         Leds::Set(ACCENT_KEY_LED, st == 0);
-        Leds::Set(SLIDE_KEY_LED,  false);
+        // SLIDE LED = selected step's ratchet: off none, solid 2x, blink 3x.
+        const uint8_t src = (!poly_sel && engine.prob_follows_edit())
+                                ? engine.ratchet_at(si) : uint8_t(0);
+        Leds::Set(SLIDE_KEY_LED,
+                  src == 2 || (src == 3 && bool((millis() >> 7) & 1)));
       }
       if (inputs[BACK_KEY].rising()) s_step_sel = -1;
     } else {
@@ -3021,15 +3167,7 @@ void loop() {
   const bool dial_track_play    = (dial == DialMode::TrackPlay);
   const bool dial_track_mode    = dial_track_write || dial_track_play;
 
-  total_transpose = int16_t(int(transpose) + int(engine.get_pattern_transpose()));
-  // In Track mode, also add the per-chain-step transpose for the slot the
-  // chain cursor is currently on. Encoding: TRACK_TRANSPOSE_ZERO (=12) means
-  // "no transpose", so we subtract that offset before adding.
-  if (engine.track_active && engine.track_has_chain()) {
-    const int8_t step_off = int8_t(engine.TrackGetTranspose(engine.get_chain_pos()))
-                          - int8_t(TRACK_TRANSPOSE_ZERO);
-    total_transpose = int16_t(int(total_transpose) + int(step_off));
-  }
+  recompute_total_transpose();
 
   // Read track index from the 3-bit dial (TRACK_BIT0..2). Tracks 0..7 select
   // 1-of-8 track slots. In track modes, the track index also forces the active
@@ -3340,7 +3478,7 @@ void loop() {
     } else if (s_keyboard_mode && (dial == DialMode::PatternPlay)) {
       ProcessKeyboardPlay();
     } else if (pitch_mod && !fn_mod && !clear_mod && !write_mode && !s_keyboard_mode) {
-      ProcessPitchMod();
+      ProcessPitchMod(clk_run);
     } else if (time_mod) {
       Leds::Set(FUNCTION_MODE_LED, true);
       // TODO: performance time effects
@@ -3484,6 +3622,14 @@ void loop() {
     }
   }
 
+  // Tap-write pending start: until the bar-1 wrap lands, keep the wrap aimed
+  // at the session start so the take begins on the pattern's own "1" (entry
+  // no longer bar-resets the clock phase -- see metro_session_begin). Runs
+  // AFTER the chain advance / A/B alternation above and overrides them. The
+  // chain cursor is parked at len-1 by metro_session_begin, so when the wrap
+  // lands on pats[0] the advance's value-search resolves the cursor to 0.
+  if (s_metronome_active && !s_metro_bar_started) metro_queue_session_start();
+
   // show all pressed buttons. Probability mode renders its own step / picker /
   // level LEDs, and its note keys (percentage entry) and black keys share the
   // step-LED matrix, so the raw echo would spuriously light step LEDs while
@@ -3577,6 +3723,11 @@ void loop() {
     s_prev_tracknum = cur_tracknum;
   }
 
+  // claim-103: latch on EVERY FN rising, not only the !edit_mode ones. If it
+  // were inside the block below it would go stale: FN pressed with TAP_NEXT
+  // held skips that block, so the latch would still hold a TIME_MODE from some
+  // earlier gesture and FN+UP would toggle triplet when the user meant double.
+  if (inputs[FUNCTION_KEY].rising()) s_fn_entry_mode = engine.get_mode();
   if (inputs[FUNCTION_KEY].rising() && !edit_mode) {
     if (s_keyboard_mode) {
       s_keyboard_mode = false;
@@ -3665,11 +3816,30 @@ void loop() {
       metro_session_begin();
     }
 
-    // CLEAR rising with a pat key held: clear that pattern (only clear path).
+    // Clear that pattern. EITHER ORDER fires (claim-100): CLEAR rising with a
+    // pat key held, or a pat key rising with CLEAR held. It used to accept only
+    // the first, so the natural gesture -- hold CLEAR, tap pattern keys, which
+    // is the order EVERY other CLEAR combo uses -- silently did nothing. This
+    // is the same defect the metronome gesture above already fixed for the same
+    // reason ("I had to press it twice"), so this is the second instance and
+    // the two now read alike.
+    // Three exclusions, each a combo that already owns CLEAR + a white key:
+    //   C#/D# held  = copy / paste          -> would WIPE the paste target
+    //   PITCH held  = randomize one attribute (C/D/E/F/G/A) -> would wipe instead
+    //   TIME held   = reserved for the same shape
+    // Without them the new press order eats three working gestures. Found by
+    // reading the combo table before flashing, not by the walk.
     // Pattern Write only -- destructive op. Suppressed during tap-write:
     // pattern keys mean SUSTAIN there, and CLEAR is half of the restart
     // gesture, so CLEAR while sustaining must not wipe a pattern.
-    if (inputs[CLEAR_KEY].rising() && !fn_mod && !edit_mode &&
+    const bool clear_pat_gesture =
+        inputs[CLEAR_KEY].rising() ||
+        (clear_mod && !pitch_mod && !time_mod &&
+         !inputs[CSHARP_KEY].held() && !inputs[DSHARP_KEY].held() &&
+         (inputs[0].rising() || inputs[1].rising() || inputs[2].rising() ||
+          inputs[3].rising() || inputs[4].rising() || inputs[5].rising() ||
+          inputs[6].rising() || inputs[7].rising()));
+    if (clear_pat_gesture && !fn_mod && !edit_mode &&
         dial_pattern_write && !s_metronome_active) {
       for (uint8_t i = 0; i < 8; ++i) {
         if (inputs[i].held()) {
@@ -3808,6 +3978,13 @@ void loop() {
           }
           s_anchor_prev_tp = tp;
         }
+        // Queued live transpose lands on the first step of the new pass, so a
+        // PITCH+key change mid-pattern never jumps mid-bar.
+        if (engine.get_time_pos() == 0 && s_transpose_queued != 0xFF) {
+          transpose = s_transpose_queued;
+          s_transpose_queued = 0xFF;
+          recompute_total_transpose();
+        }
         // Metronome tap-write, boundary duties: bar/chain bookkeeping and the
         // metronome click. All WRITING happens on the tick grid below, where
         // the ROM does it (accept/decision ticks), not at boundaries.
@@ -3816,20 +3993,16 @@ void loop() {
           const uint8_t tp      = engine.get_time_pos();
           if (tp == 0) {
             if (!s_metro_bar_started) {
-              s_metro_bar_started = true;        // bar reset landed: recording on
+              s_metro_bar_started   = true;   // bar 1 wrap landed: recording on
+              s_metro_press_pending = false;  // a count-in tap must not write step 0
             } else {
               if (s_metro_record_phase && !s_metro_pass_accept) {
                 // ROM bar validation: a RECORD pass none of whose taps was
                 // still held at its accept tick ends as an EMPTY bar -- stale
                 // writes are discarded and the metronome keeps looping,
                 // exactly like the ROM's endless empty-measure record loop.
-                Sequence &pseq = engine.pattern[s_metro_prev_pat];
-                if (pseq.note_count()) {
-                  for (uint8_t i = 0; i < pseq.length; ++i)
-                    sequence_set_time_at(pseq, i, 0);
-                  engine.stale = true;
-                  midi_send_pattern_update(s_metro_prev_pat);
-                }
+                if (engine.pattern[s_metro_prev_pat].note_count())
+                  metro_wipe_time(s_metro_prev_pat);
               }
               // One guided pass through the whole unit, then DONE: at the
               // wrap that completes a full pass (every chain member's bar,
@@ -4040,7 +4213,12 @@ void loop() {
     // and doubling either restores the retained tail or copies the first half.
     if (fn_mod && !pitch_mod && dial_pattern_write) {
       Sequence &seq = engine.get_edit_sequence();
-      if (engine.get_mode() == TIME_MODE) {
+      // claim-103: the live mode is NORMAL by now whenever FN was pressed on
+      // its own, because FN rising exits the submode. Accept EITHER the latched
+      // entry mode or the live one: the live test is what still works when
+      // TAP_NEXT is held (that suppresses the FN-rising block entirely, so the
+      // latch does not update), and it was the only reachable path before.
+      if (s_fn_entry_mode == TIME_MODE || engine.get_mode() == TIME_MODE) {
         if (inputs[UP_KEY].rising()) {
           // Triplet pages are 12 steps instead of 16, so the ceiling drops
           // from 64 to 48. The time stream is NOT re-paged: it stays linear,
@@ -4084,7 +4262,8 @@ void loop() {
     // While FN is held in TIME MODE, UP_KEY_LED shows the section's triplet
     // state (spec 7: "the UP LED being lit while FUNCTION is held in TIME
     // MODE"). Outside TIME MODE the key means double, so no state to show.
-    if (fn_mod && dial_pattern_write && engine.get_mode() == TIME_MODE) {
+    if (fn_mod && dial_pattern_write &&
+        (s_fn_entry_mode == TIME_MODE || engine.get_mode() == TIME_MODE)) {
       Leds::Set(UP_KEY_LED, engine.edit_seq_view().is_triplet_mode());
     }
 
@@ -4143,7 +4322,15 @@ void loop() {
               s_tap_pitch_preview_slide  = false; // previews never slide
               s_tap_pitch_preview_gate   = true;
               midi_audition_note_on(uint8_t(mn), acc ? 127 : 80);
+              // Ratchet steps re-strike so the ratchet is audible on preview.
+              const uint8_t rc = engine.prob_follows_edit()
+                                     ? engine.ratchet_at(tp) : uint8_t(0);
+              arm_ratchet_audition(rc, uint8_t(mn), acc ? 127 : 80);
+            } else {
+              s_rat_aud_hits = 0;
             }
+          } else {
+            s_rat_aud_hits = 0;
           }
         }
       }
@@ -4267,7 +4454,11 @@ void loop() {
       && !s_step_sel_mode && !s_scale_mode && !engine.in_poly_pitch_edit()) {
 
     if (engine.get_mode() == TIME_MODE) {
-      // SLIDE_KEY step-lock toggle removed (RAM-only after OS-303 migration).
+      // SLIDE cycles the cursor step's ratchet (off -> 2x -> 3x -> off); the
+      // same gesture as the TAP-held edit path. FN excluded (FN+SLIDE is the
+      // probability-mode gesture) and var1 resident only.
+      if (!fn_mod && inputs[SLIDE_KEY].rising() && engine.prob_follows_edit())
+        cycle_ratchet_and_mirror(uint8_t(engine.edit_seq_view().time_pos & (MAX_STEPS - 1)));
       if (clk_run) {
         input_time(true, true);
       } else if (!fn_mod && check_time_inputs() &&
@@ -4331,9 +4522,12 @@ void loop() {
         cur_patsel != s_last_patsel_for_transpose &&
         dial_play_mode) {
       transpose = 12;
+      s_transpose_queued = 0xFF; // switching patterns resets transpose state fully
     }
     s_last_patsel_for_transpose = cur_patsel;
   }
+
+  ServiceRatchetAudition();
 
   OutputDAC(clk_run, write_mode, track_mode, edit_mode, pitch_mod, fn_mod,
             dial_play_mode);

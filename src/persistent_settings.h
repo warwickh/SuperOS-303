@@ -11,7 +11,9 @@
 #include "poly.h"
 
 // SysEx / flash pattern blob = 92 raw bytes (pitch[64] + time_data[16] + 12 metadata).
-static constexpr int PATTERN_SIZE = MAX_STEPS + (MAX_STEPS / 4) + METADATA_SIZE;
+// +MAX_STEPS/4 for the per-step ratchet block (moved into the pattern blob
+// 2026-08-31; see Sequence::ratchet[]). 52 -> 60 at MAX_STEPS = 32.
+static constexpr int PATTERN_SIZE = MAX_STEPS + (MAX_STEPS / 4) + METADATA_SIZE + (MAX_STEPS / 4);
 
 static_assert(POLY_STEPS == MAX_STEPS, "poly step count must match MAX_STEPS");
 static_assert(POLY_BLOB_SIZE <= FE_MAX_PAYLOAD, "poly blob must fit one flash record");
@@ -26,8 +28,12 @@ static_assert(FB_SETTINGS_LEN <= FE_MAX_PAYLOAD, "settings block must fit one re
 // "s32a" = 32-step section layout (MAX_STEPS 32): pattern/poly/prob regions and
 // the paired-track record changed size, so old records must not be half-read.
 // The new prefix fails the compat check against any "sa4p" arena and formats.
-const char *const sig_pew = "superOS-s32a-v1";
-const char *const sig_compat_prefix = "superOS-s32a";
+// "s32b" (2026-08-31): the per-step ratchet moved OUT of the probability table
+// INTO the pattern blob (PATTERN_SIZE 52 -> 60, prob region lost its ratchet
+// tail), so both the pattern record and the prob region changed size. A "s32a"
+// arena must format rather than half-read the new layout.
+const char *const sig_pew = "superOS-s32b-v1";
+const char *const sig_compat_prefix = "superOS-s32b";
 static constexpr int kSigCompatPrefixLen = 12;
 static constexpr int kSigEepromLen = 16;
 
@@ -51,6 +57,10 @@ struct PersistentSettings {
   uint8_t var3_channel = 3;
   /// Per-slot bitmap: bit set = variation 3 of that slot is polyphonic.
   uint8_t var3_poly[NUM_SLOTS / 8] = {0};
+  /// SysEx enables. Stored as DISABLED bits in the byte-17 flags (bit1 rx,
+  /// bit2 tx) so old settings blocks (b[17] = 0/1) read back as enabled.
+  bool sysex_rx_enable = true;
+  bool sysex_tx_enable = true;
 
   static constexpr uint8_t kTrackFormatVersion = 4;
 
@@ -65,14 +75,17 @@ struct PersistentSettings {
   }
 
   // Settings block byte layout (FB_SETTINGS_LEN = 38):
-  //   [0..15] signature  [16] midi_channel  [17] flags(bit0=clock_rx)
+  //   [0..15] signature  [16] midi_channel
+  //   [17] flags(bit0=clock_rx, bit1=sysex_rx_DISABLED, bit2=sysex_tx_DISABLED)
   //   [18] direction  [19] thru  [20] led_brightness  [21] track_format
   //   [22] var2_channel  [23] var3_channel  [24..37] var3 poly bitmap
   //   (14 bytes = 112 slots, one bit each)
   void serialize(uint8_t *b) const {
     memcpy(b, signature, 16);
     b[16] = midi_channel;
-    b[17] = midi_clock_receive ? 1 : 0;
+    b[17] = static_cast<uint8_t>((midi_clock_receive ? 1 : 0) |
+                                 (sysex_rx_enable ? 0 : 2) |
+                                 (sysex_tx_enable ? 0 : 4));
     b[18] = sequence_direction;
     b[19] = midi_thru ? 1 : 0;
     b[20] = led_brightness;
@@ -84,7 +97,12 @@ struct PersistentSettings {
   void deserialize(const uint8_t *b) {
     memcpy(signature, b, 16);
     midi_channel       = (b[16] <= 16) ? b[16] : 1;
-    midi_clock_receive = (b[17] <= 1)  ? (b[17] != 0) : true;
+    {
+      const uint8_t fl = (b[17] <= 7) ? b[17] : 1; // garbage -> defaults
+      midi_clock_receive = (fl & 1) != 0;
+      sysex_rx_enable    = (fl & 2) == 0;
+      sysex_tx_enable    = (fl & 4) == 0;
+    }
     sequence_direction = (b[18] < uint8_t(DIR_COUNT)) ? b[18] : 0;
     midi_thru          = (b[19] == 1);
     led_brightness     = (b[20] >= 1 && b[20] <= 8) ? b[20] : 8;
@@ -138,11 +156,13 @@ inline void serialize_pattern(const Sequence &seq, uint8_t *dst) {
   memcpy(dst, seq.pitch, MAX_STEPS);
   memcpy(dst + MAX_STEPS, seq.time_data, MAX_STEPS / 4);
   memcpy(dst + MAX_STEPS + (MAX_STEPS / 4), seq.reserved, METADATA_SIZE); // reserved[]+transpose+engine+length
+  memcpy(dst + MAX_STEPS + (MAX_STEPS / 4) + METADATA_SIZE, seq.ratchet, MAX_STEPS / 4);
 }
 inline void deserialize_pattern(Sequence &seq, const uint8_t *src) {
   memcpy(seq.pitch, src, MAX_STEPS);
   memcpy(seq.time_data, src + MAX_STEPS, MAX_STEPS / 4);
   memcpy(seq.reserved, src + MAX_STEPS + (MAX_STEPS / 4), METADATA_SIZE);
+  memcpy(seq.ratchet, src + MAX_STEPS + (MAX_STEPS / 4) + METADATA_SIZE, MAX_STEPS / 4);
 }
 inline void clear_pattern_bytes(Sequence &seq) {
   memset(seq.pitch, PITCH_EMPTY, MAX_STEPS);

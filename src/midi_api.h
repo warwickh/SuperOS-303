@@ -121,6 +121,7 @@ void midi_send_scale_update(uint8_t pat, uint16_t mask, bool enabled, uint8_t va
 /// the firmware coin-flips which shift applies.
 /// Format: F0 7D 2B <pat:0-15> <step:0-63> <b0> <b1> <b2> F7
 void midi_send_prob_step(uint8_t pat, uint8_t step, uint8_t b0, uint8_t b1, uint8_t b2);
+void midi_send_ratchet_step(uint8_t pat, uint8_t step, uint8_t count);
 /// Device->host full probability-table push (SysEx 0x2D) for one pattern, sent
 /// after a hardware randomize so the editor resyncs in one message.
 void midi_send_prob_table(uint8_t pat);

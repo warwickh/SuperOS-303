@@ -30,7 +30,8 @@ inline uint16_t pattern_index_of(uint8_t abs_slot, uint8_t var) {
 }
 
 static constexpr uint8_t PC_TIME_OFF  = 1 + METADATA_SIZE;               // 13
-static constexpr uint8_t PC_PITCH_OFF = uint8_t(PC_TIME_OFF + MAX_STEPS / 4);
+static constexpr uint8_t PC_RAT_OFF   = uint8_t(PC_TIME_OFF + MAX_STEPS / 4); // 21
+static constexpr uint8_t PC_PITCH_OFF = uint8_t(PC_RAT_OFF + MAX_STEPS / 4);  // 29
 
 inline void pattern_trim_encode(const Sequence &seq, uint8_t *region) {
   uint8_t n = 0;
@@ -39,6 +40,7 @@ inline void pattern_trim_encode(const Sequence &seq, uint8_t *region) {
   region[0] = n;
   memcpy(region + 1,           seq.reserved,  METADATA_SIZE);
   memcpy(region + PC_TIME_OFF, seq.time_data, MAX_STEPS / 4);
+  memcpy(region + PC_RAT_OFF,  seq.ratchet,   MAX_STEPS / 4);
   memcpy(region + PC_PITCH_OFF, seq.pitch,    n);
 }
 
@@ -46,6 +48,7 @@ inline void pattern_trim_decode(Sequence &seq, const uint8_t *region) {
   const uint8_t n = region[0];
   memcpy(seq.reserved,  region + 1,           METADATA_SIZE);
   memcpy(seq.time_data, region + PC_TIME_OFF, MAX_STEPS / 4);
+  memcpy(seq.ratchet,   region + PC_RAT_OFF,  MAX_STEPS / 4);
   memset(seq.pitch, PITCH_EMPTY, MAX_STEPS);
   memcpy(seq.pitch, region + PC_PITCH_OFF, n);
 }
