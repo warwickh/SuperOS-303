@@ -782,6 +782,8 @@
         <button class="btn" id="btnRandSlide">Slide</button>
         <button class="btn" id="btnRandAll">All</button>
         <button class="btn" id="btnRandBrownian">Brownian</button>
+        <button class="btn" id="btnRandDevice" title="Let the 303 itself randomize this pattern (SysEx 0x2E: new time + pitch stream, ratchets and step probabilities cleared, variation 1 only, firmware 1.1.0+), then read it back">On device</button>
+        <input type="number" id="randDensity" min="0" max="127" value="76" style="width:54px" title="On-device density 0-127: chance that a step is a note (76 = 60%)">
       </div>
     </div>
     <div class="group">
@@ -1935,6 +1937,54 @@
   // "Switch to SuperOS" action instead of hanging on unanswered SysEx.
   var deviceMode     = 'unknown';
   var hwVersion      = '';     // firmware version string from the 0x21 reply tail ('' = not reported)
+  // Firmware-compatibility banner. The 1.1.0 build moved the per-step ratchet
+  // into the pattern blob (52 -> 60 raw bytes, 60 -> 69 packed on the wire).
+  // The WIRE is the authority, not the version string: a 0x11 reply in the old
+  // 60-packed shape proves an old device (red banner), a 0x11 that parses at
+  // PATTERN_SIZE proves a compatible one and clears any banner. The version
+  // string only gets a soft (amber) banner until a pattern has been read, because
+  // a build can carry a stale custom_project_version (the USB-C 1.1.0-feature
+  // build reports "1.0.0-beta").
+  var MIN_FW_VERSION = '1.1.0';
+  var hwOldWire = false;   // a 0x11 arrived in the pre-1.1.0 (52-byte) shape
+  var hwWireOk  = false;   // a 0x11 parsed at the current PATTERN_SIZE
+  // Compare dotted numeric versions; a pre-release suffix ('-beta') is ignored,
+  // so 1.0.0-beta reads as 1.0.0. Returns -1/0/1.
+  function cmpVersion(a, b) {
+    var pa = String(a).split('-')[0].split('.');
+    var pb = String(b).split('-')[0].split('.');
+    for (var i = 0; i < 3; i++) {
+      var na = parseInt(pa[i], 10) || 0, nb = parseInt(pb[i], 10) || 0;
+      if (na !== nb) return na < nb ? -1 : 1;
+    }
+    return 0;
+  }
+  function checkFirmwareUpToDate() {
+    var el = document.getElementById('fwUpdateBanner');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'fwUpdateBanner';
+      el.style.cssText = 'position:sticky;top:0;z-index:9999;color:#fff;' +
+        'padding:10px 16px;font:600 14px/1.4 var(--font);text-align:center;display:none;';
+      document.body.insertBefore(el, document.body.firstChild);
+    }
+    var versionOld = deviceMode === 'superos' && !!hwVersion && cmpVersion(hwVersion, MIN_FW_VERSION) < 0;
+    if (deviceMode === 'superos' && hwOldWire) {
+      el.style.background = '#cc0000';
+      el.innerHTML = 'Your 303 firmware' + (hwVersion ? ' (v' + hwVersion + ')' : '') +
+        ' uses the pre-1.1.0 pattern format, so patterns cannot be read or written from this editor. ' +
+        'Please update your 303 to firmware v' + MIN_FW_VERSION + ' or newer.';
+      el.style.display = 'block';
+    } else if (versionOld && !hwWireOk) {
+      el.style.background = '#b36b00';
+      el.innerHTML = 'Your 303 reports firmware v' + hwVersion + ', older than the v' + MIN_FW_VERSION +
+        ' this editor is built for. If patterns fail to load, update the 303 firmware; ' +
+        'this notice clears by itself once a pattern reads back correctly.';
+      el.style.display = 'block';
+    } else {
+      el.style.display = 'none';
+    }
+  }
   // True from the moment the user sends 0x2F/0x4D until the device is re-identified
   // (or we give up). Widens the config-read retry budget so the reboot + USB
   // re-enumerate window doesn't trip the normal fast-fail "wrong device" disconnect.
@@ -2322,7 +2372,7 @@
   function setDeviceMode(mode) {
     deviceMode = mode;
     if (mode !== 'unknown') fwSwitchPending = false; // device re-identified: reconnect done
-    if (mode === 'unknown') hwVersion = '';
+    if (mode === 'unknown') { hwVersion = ''; hwOldWire = false; hwWireOk = false; }
     updateV12bUi();
     document.body.classList.toggle('mode-d650', mode === 'd650');
     var el = document.getElementById('fwModeStatus');
@@ -2330,6 +2380,7 @@
                                     : mode === 'd650'    ? 'D650C emulator'
                                     : 'unknown');
     updateButtons();
+    checkFirmwareUpToDate();   // hide the banner off SuperOS, show it on an old one
   }
 
   function currentPatLen() {
@@ -3949,7 +4000,11 @@
     }
 
     if (cmd === 0x11) {
-      if (bytes.length < 5 + PACKED_SIZE) { log('0x11 too short (' + bytes.length + ')', 'log-err'); return; }
+      if (bytes.length < 5 + PACKED_SIZE) {
+        // 60 packed bytes = the pre-1.1.0 52-byte pattern: an old firmware, not a truncated reply.
+        if (bytes.length >= 5 + 60 && !hwOldWire) { hwOldWire = true; checkFirmwareUpToDate(); }
+        log('0x11 too short (' + bytes.length + ')', 'log-err'); return;
+      }
       var pat = bytes[2] & 0x0f;
       var rVar = (bytes.length > 5 + PACKED_SIZE) ? (bytes[5 + PACKED_SIZE] & 0x03) : 0;
       if (rVar > 2) rVar = 0;
@@ -3957,6 +4012,7 @@
       var raw = unpack7(bytes.subarray(5), PATTERN_SIZE);
       if (!raw)         { log('0x11 unpack failed', 'log-err'); return; }
       if (xorBlob(raw) !== cx) { log('0x11 checksum mismatch', 'log-err'); return; }
+      if (!hwWireOk || hwOldWire) { hwWireOk = true; hwOldWire = false; checkFirmwareUpToDate(); }
 
       // Bulk replies must match the awaited linear index (var*16 + pat). An
       // unsolicited 0x11 (hardware edit broadcast) arriving mid-bulk used to
@@ -4484,6 +4540,7 @@
         hwVersion = vs;
       }
       setDeviceMode('superos');
+      checkFirmwareUpToDate();   // warn if the 303 needs a firmware update
       // First confirmed SuperOS reply this connection: kick off the bulk pattern
       // dump. If the 0x1C reply below reveals a different hardware group, that
       // handler aborts and restarts the bulk for the right group.
@@ -5185,6 +5242,26 @@
     pushHistory(activeGroup, activePat); saveGroupsToLS(); renderGrid(); recomputeDirty();
     pushFullPatternNow();
     log('Brownian pitches applied', 'log-ack');
+  };
+  // Fleet RANDOMIZE opcode (0x2E <pat> <lane> <density> <seed_lo> <seed_hi>): the
+  // 303 has no lanes, so lane 0x7F = the whole pattern. Seed 0 = device entropy.
+  // The device regenerates time + pitch and clears that pattern's ratchets and
+  // probability table, so both are re-read afterwards instead of guessed here.
+  document.getElementById('btnRandDevice').onclick = function() {
+    if (!midiOut) { log('Device randomize skipped: connect MIDI output to the 303', 'log-err'); return; }
+    if (deviceMode !== 'superos') { log('Device randomize needs the 303 in SuperOS mode', 'log-err'); return; }
+    if (hwGroup >= 0 && activeGroup !== hwGroup) {
+      log('Device randomize skipped: editor group ' + (activeGroup+1) + ' != device group ' + (hwGroup+1), 'log-err');
+      return;
+    }
+    if (curIsPoly() || slotVar[activeGroup][activePat] !== VAR_303) { log('Device randomize (0x2E) is variation 1 only', 'log-err'); return; }
+    var d = parseInt(document.getElementById('randDensity').value, 10);
+    if (isNaN(d)) d = 76;
+    d = Math.max(0, Math.min(127, d));
+    var pat = activePat & 15;
+    sendSysex(new Uint8Array([0x7d, 0x2e, pat, 0x7f, d, 0, 0]));
+    log('Device randomize pattern ' + (pat + 1) + ' density ' + d + ' (0x2E)', 'log-syx');
+    setTimeout(function() { requestPattern(pat); requestProbTable(pat); }, 200);
   };
 
   // ── Octave set / clamp ─────────────────────────────────────────────
