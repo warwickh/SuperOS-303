@@ -6043,7 +6043,7 @@ function romEncodeSyx(rom) {
   // wire bytes. Backup pulls all 8 sequentially; restore pushes them back and
   // waits for each 0x48 ack. This is the NATIVE 303 memory image — it restores
   // onto a D650C-mode unit; it is not a SuperOS pattern format.
-  var D650_BLOCK_RAW = 96, D650_BLOCK_WIRE = 110, D650_BLOCKS = 8;
+  var D650_BLOCK_RAW = 96, D650_BLOCK_WIRE = 110, D650_BLOCKS = 16;
   var d650Blocks = new Array(D650_BLOCKS);
   var d650ReadPending = false, d650WritePending = false;
   var d650WriteData = null, d650Timer = null;
