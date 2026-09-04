@@ -6039,11 +6039,11 @@ function romEncodeSyx(rom) {
 
   // ── D650C native pattern store backup/restore (SysEx 0x46/0x47/0x48) ────
   // The d650 side exposes its full uPD444 pattern memory (3072 nibbles packed
-  // 2/byte = 1536 bytes) as 8 raw blocks of 192 bytes, 7-bit packed to 220
+  // 2/byte = 1536 bytes) as 8 raw blocks of 96 bytes, 7-bit packed to 220
   // wire bytes. Backup pulls all 8 sequentially; restore pushes them back and
   // waits for each 0x48 ack. This is the NATIVE 303 memory image — it restores
   // onto a D650C-mode unit; it is not a SuperOS pattern format.
-  var D650_BLOCK_RAW = 192, D650_BLOCK_WIRE = 220, D650_BLOCKS = 8;
+  var D650_BLOCK_RAW = 96, D650_BLOCK_WIRE = 110, D650_BLOCKS = 8;
   var d650Blocks = new Array(D650_BLOCKS);
   var d650ReadPending = false, d650WritePending = false;
   var d650WriteData = null, d650Timer = null;
