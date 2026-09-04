@@ -148,7 +148,7 @@ static_assert(EE_OFF_ROM + D650_ROM_SIZE <= EE_OFF_DIAG,
               "uploaded mask ROM overlaps the wedge diagnostics");
 #endif
 
-static const uint8_t PATT_BLK_BASE = 100, PATT_BLK_LEN = 192;
+static const uint8_t PATT_BLK_BASE = 100, PATT_BLK_LEN = 96;
 // 0x47 bounds blk by PATT_BLK_N; this is the check that PATT_BLK_N * the block
 // length cannot address past the store it is writing into.
 static const uint8_t PATT_BLK_N = D650_EXT_BYTES / PATT_BLK_LEN;   // 8
