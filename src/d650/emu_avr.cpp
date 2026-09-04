@@ -615,7 +615,7 @@ static void clock_out_service() {
   }
   while (s_clk_out_mark != g_sync.clk_edges) {
     ++s_clk_out_mark;
-    midi_tx(0xF8);
+    //midi_tx(0xF8);
 #ifdef SUPEROS_USB_MIDI
     if (usb_sof_alive()) usbMIDI.sendRealTime(0xF8);
 #endif
