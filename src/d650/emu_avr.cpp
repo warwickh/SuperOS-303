@@ -773,7 +773,7 @@ static void usb_send_status() {
 }
 // 7-bit pack/unpack (SuperOS midi.cpp scheme): each group of up to 7 raw bytes
 // goes out as 1 MSB-bitmap byte + 7 low-7-bit bytes. 192 raw -> 220 wire bytes.
-static const uint16_t PATT_WIRE_LEN = 220;
+static const uint16_t PATT_WIRE_LEN = 110;
 static uint16_t pack7(const uint8_t *src, uint16_t len, uint8_t *out) {
   uint16_t o = 0;
   for (uint16_t i = 0; i < len; i += 7) {
