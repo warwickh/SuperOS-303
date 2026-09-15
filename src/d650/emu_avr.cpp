@@ -283,8 +283,22 @@ static uint8_t run_line_level();
 // ---------------------------------------------------------------------------
 static inline void midi_tx(uint8_t b) { Serial1.write(b); }
 static uint8_t midi_out_ch() { return g_set.midi_channel ? (uint8_t)(g_set.midi_channel - 1) : 0; }
-static void send_note_on (void *, uint8_t n, uint8_t v){
-  midi_tx(0x90|midi_out_ch()); midi_tx(n); midi_tx(v);
+static void send_note_on(void *, uint8_t n, uint8_t v) {
+    midi_tx(0x90 | midi_out_ch());
+    midi_tx(n);
+    midi_tx(v);
+
+#ifdef SUPEROS_USB_MIDI
+    if (usb_sof_alive()) {
+        usbMIDI.sendNoteOn(
+            n,
+            v,
+            (uint8_t)(midi_out_ch() + 1)
+        );
+        usbMIDI.send_now();
+    }
+#endif
+}
 
 #ifdef D650_ROM_IN_RAM
 
@@ -325,7 +339,6 @@ static void din_send_pattern_ack(uint8_t blk,
     midi_tx(status);
     midi_tx(0xF7);
 }
-#endif  
 
 static void din_write_pattern_block(uint8_t blk,
                                     const uint8_t *packed,
@@ -373,6 +386,35 @@ static void din_write_pattern_block(uint8_t blk,
 #endif
 
     din_send_pattern_ack(blk, 0);
+}
+
+#endif
+
+#ifdef SUPEROS_COMBINED
+
+    eeprom_update_block(
+        dst,
+        EE_EMU_PATT +
+            (uint16_t)blk * PATT_BLK_LEN,
+        PATT_BLK_LEN
+    );
+
+    eeprom_update_byte(
+        EE_EMU_MAGIC,
+        EE_EMU_MAGIC_VAL
+    );
+
+#else
+
+    g_flash.write(
+        (uint8_t)(PATT_BLK_BASE + blk),
+        dst,
+        PATT_BLK_LEN
+    );
+
+#endif
+
+    din_send_pattern_ack(blk, 0);
 
 #ifdef SUPEROS_USB_MIDI
   if (usb_sof_alive()) {
@@ -380,7 +422,7 @@ static void din_write_pattern_block(uint8_t blk,
     usbMIDI.send_now();
   }
 #endif
-}
+
 static void send_note_off(void *, uint8_t n){
   midi_tx(0x80|midi_out_ch()); midi_tx(n); midi_tx(0);
 #ifdef SUPEROS_USB_MIDI
@@ -1158,8 +1200,6 @@ static void usb_sysex_msg(const uint8_t *data, unsigned int sz) {
     }
     break;
   case 0x46:
-    const uint8_t r[3] = { 0x7D, 0x4C, 0x77 };
-    if (usb_sof_alive()) usbMIDI.sendSysEx(3, r, false);
     if (n >= 3 && p[2] < PATT_BLK_N) usb_send_ram_block(p[2]);
     break;
   case 0x49:   // RUN line test override: 0/1 force level, 2 = auto (default)
