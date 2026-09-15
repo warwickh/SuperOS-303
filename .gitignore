@@ -1,6 +1,7 @@
 .pio
 *.hex
 *.syx
+*.pyc 
 
 .claude/
 .vscode/
