@@ -846,6 +846,8 @@ static void usb_sysex_msg(const uint8_t *data, unsigned int sz) {
     }
     break;
   case 0x46:
+    const uint8_t r[3] = { 0x7D, 0x4C, 0x77 };
+    if (usb_sof_alive()) usbMIDI.sendSysEx(3, r, false);
     if (n >= 3 && p[2] < PATT_BLK_N) usb_send_ram_block(p[2]);
     break;
   case 0x49:   // RUN line test override: 0/1 force level, 2 = auto (default)
