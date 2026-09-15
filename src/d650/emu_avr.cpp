@@ -155,28 +155,63 @@ static const uint8_t PATT_BLK_N = D650_EXT_BYTES / PATT_BLK_LEN;   // 8
 static_assert(PATT_BLK_N * (uint16_t)PATT_BLK_LEN <= D650_EXT_BYTES,
               "pattern block writes run past the uPD444 store");
 
-// 7-bit pack/unpack (SuperOS midi.cpp scheme): each group of up to 7 raw bytes
-// goes out as 1 MSB-bitmap byte + 7 low-7-bit bytes. 192 raw -> 220 wire bytes.
+// 7-bit SysEx packing shared by USB and DIN.
+//
+// Every group of up to seven raw bytes becomes:
+//   one MSB bitmap byte
+//   followed by up to seven low-7-bit data bytes.
+//
+// 192 raw bytes become exactly 220 packed bytes.
 static const uint16_t PATT_WIRE_LEN = 220;
-static uint16_t pack7(const uint8_t *src, uint16_t len, uint8_t *out) {
-  uint16_t o = 0;
-  for (uint16_t i = 0; i < len; i += 7) {
-    uint8_t msb = 0;
-    const uint8_t n = (len - i >= 7) ? 7 : (uint8_t)(len - i);
-    for (uint8_t b = 0; b < n; ++b)
-      if (src[i + b] & 0x80) msb |= (uint8_t)(1u << b);
-    out[o++] = msb;
-    for (uint8_t b = 0; b < n; ++b) out[o++] = src[i + b] & 0x7F;
-  }
-  return o;
+
+static uint16_t pack7(const uint8_t *src,
+                      uint16_t len,
+                      uint8_t *out) {
+    uint16_t o = 0;
+
+    for (uint16_t i = 0; i < len; i += 7) {
+        uint8_t msb = 0;
+
+        const uint8_t n =
+            (len - i >= 7)
+                ? 7
+                : (uint8_t)(len - i);
+
+        for (uint8_t b = 0; b < n; ++b) {
+            if (src[i + b] & 0x80)
+                msb |= (uint8_t)(1u << b);
+        }
+
+        out[o++] = msb;
+
+        for (uint8_t b = 0; b < n; ++b)
+            out[o++] = src[i + b] & 0x7F;
+    }
+
+    return o;
 }
-static void unpack7(const uint8_t *src, uint16_t wire_len, uint8_t *out) {
-  uint16_t i = 0, o = 0;
-  while (i < wire_len) {
-    const uint8_t msb = src[i++];
-    for (uint8_t b = 0; b < 7 && i < wire_len; ++b)
-      out[o++] = (uint8_t)(src[i++] | ((msb >> b) & 1 ? 0x80 : 0));
-  }
+
+static bool unpack7_checked(const uint8_t *src,
+                            uint16_t wire_len,
+                            uint8_t *out,
+                            uint16_t out_len) {
+    uint16_t i = 0;
+    uint16_t o = 0;
+
+    while (i < wire_len && o < out_len) {
+        const uint8_t msb = src[i++];
+
+        for (uint8_t b = 0;
+             b < 7 && i < wire_len && o < out_len;
+             ++b) {
+            out[o++] = (uint8_t)(
+                src[i++] |
+                (((msb >> b) & 1u) ? 0x80 : 0)
+            );
+        }
+    }
+
+    return i == wire_len && o == out_len;
 }
 
 // Deferred incremental pattern save (see loop). flash_write_page halts the
@@ -250,6 +285,94 @@ static inline void midi_tx(uint8_t b) { Serial1.write(b); }
 static uint8_t midi_out_ch() { return g_set.midi_channel ? (uint8_t)(g_set.midi_channel - 1) : 0; }
 static void send_note_on (void *, uint8_t n, uint8_t v){
   midi_tx(0x90|midi_out_ch()); midi_tx(n); midi_tx(v);
+
+#ifdef D650_ROM_IN_RAM
+
+static uint8_t s_din_patt_buf[1 + PATT_WIRE_LEN];
+
+static void din_send_pattern_block(uint8_t blk) {
+    if (blk >= PATT_BLK_N)
+        return;
+
+    const uint8_t *src =
+        &H.ext[(uint16_t)blk * PATT_BLK_LEN];
+
+    uint8_t *packed = s_din_patt_buf;
+
+    const uint16_t packed_len =
+        pack7(src, PATT_BLK_LEN, packed);
+
+    if (packed_len != PATT_WIRE_LEN)
+        return;
+
+    midi_tx(0xF0);
+    midi_tx(0x7D);
+    midi_tx(0x47);
+    midi_tx(blk);
+
+    for (uint16_t i = 0; i < packed_len; ++i)
+        midi_tx(packed[i]);
+
+    midi_tx(0xF7);
+}
+
+static void din_send_pattern_ack(uint8_t blk,
+                                 uint8_t status) {
+    midi_tx(0xF0);
+    midi_tx(0x7D);
+    midi_tx(0x48);
+    midi_tx(blk);
+    midi_tx(status);
+    midi_tx(0xF7);
+}
+
+static void din_write_pattern_block(uint8_t blk,
+                                    const uint8_t *packed,
+                                    uint16_t packed_len) {
+    if (blk >= PATT_BLK_N ||
+        packed_len != PATT_WIRE_LEN) {
+        din_send_pattern_ack(blk, 1);
+        return;
+    }
+
+    uint8_t *dst =
+        &H.ext[(uint16_t)blk * PATT_BLK_LEN];
+
+    if (!unpack7_checked(
+            packed,
+            packed_len,
+            dst,
+            PATT_BLK_LEN)) {
+        din_send_pattern_ack(blk, 1);
+        return;
+    }
+
+#ifdef SUPEROS_COMBINED
+
+    eeprom_update_block(
+        dst,
+        EE_EMU_PATT +
+            (uint16_t)blk * PATT_BLK_LEN,
+        PATT_BLK_LEN
+    );
+
+    eeprom_update_byte(
+        EE_EMU_MAGIC,
+        EE_EMU_MAGIC_VAL
+    );
+
+#else
+
+    g_flash.write(
+        (uint8_t)(PATT_BLK_BASE + blk),
+        dst,
+        PATT_BLK_LEN
+    );
+
+#endif
+
+    din_send_pattern_ack(blk, 0);
+
 #ifdef SUPEROS_USB_MIDI
   if (usb_sof_alive()) {
     usbMIDI.sendNoteOn(n, v, (uint8_t)(midi_out_ch() + 1));
@@ -479,65 +602,252 @@ static void rom_rx_feed(uint8_t b) {
   }
 }
 #endif
-static void midi_in_poll() {
-  while (Serial1.available()) {
-    uint8_t b = (uint8_t)Serial1.read();
+
+
 #ifdef D650_ROM_IN_RAM
-    // Mask-ROM upload over DIN. Fed the raw byte before the channel parser (its
-    // SysEx data bytes are otherwise discarded here).
-    rom_rx_feed(b);
-    // Minimal DIN matcher for the web editor's no-payload queries, so the unit
-    // is recognizable over DIN while it sits in D650C mode: F0 7D 36 F7 -> 0x37
-    // ROM status (0 none / 1 EEPROM / 2 embedded); F0 7D 40 F7 -> the 0x41
-    // status reply (the editor's connection probe). Realtime bytes (>=0xF8) may
-    // interleave and must not disturb the walk.
-    if (b < 0xF8) {
-      static uint8_t s_sxq = 0, s_sxcmd = 0;
-      if (b == 0xF0) { s_sxq = 1; }
-      else if (s_sxq == 1) s_sxq = (b == 0x7D) ? 2 : 0;
-      else if (s_sxq == 2) { s_sxcmd = b; s_sxq = 3; }
-      else if (s_sxq == 3) {
-        if (b == 0xF7) {
-          if (s_sxcmd == 0x36) {
-            const uint8_t st = s_rom_valid
-              ? ((eeprom_read_byte(EE_ROM_MAGIC) == EE_ROM_MAGIC_VAL) ? 1 : 2) : 0;
-            midi_tx(0xF0); midi_tx(0x7D); midi_tx(0x37); midi_tx(st); midi_tx(0xF7);
-          } else if (s_sxcmd == 0x40) {
+
+enum DinSysExState : uint8_t {
+    DIN_SYSEX_IDLE = 0,
+    DIN_SYSEX_WAIT_VENDOR,
+    DIN_SYSEX_WAIT_COMMAND,
+    DIN_SYSEX_PAYLOAD
+};
+
+static DinSysExState s_din_sx_state = DIN_SYSEX_IDLE;
+static uint8_t s_din_sx_cmd = 0;
+static uint16_t s_din_sx_len = 0;
+static bool s_din_sx_overflow = false;
+
+static void din_handle_d650_sysex() {
+    switch (s_din_sx_cmd) {
+    case 0x36: {
+        if (s_din_sx_len != 0)
+            return;
+
+        const uint8_t st = s_rom_valid
+            ? ((eeprom_read_byte(EE_ROM_MAGIC) ==
+                EE_ROM_MAGIC_VAL) ? 1 : 2)
+            : 0;
+
+        midi_tx(0xF0);
+        midi_tx(0x7D);
+        midi_tx(0x37);
+        midi_tx(st);
+        midi_tx(0xF7);
+        break;
+    }
+
+    case 0x40:
+        if (s_din_sx_len == 0)
             din_send_status();
-          } else if (s_sxcmd == 0x4A) {
-            // Bootloader entry must work over DIN too: the no-USB-C hardware
-            // has no other transport, and the whole point of 0x4A is updating
-            // without the power-on button combo.
-            enter_bootloader();                    // does not return
-#ifdef SUPEROS_COMBINED
-          } else if (s_sxcmd == 0x4D) {
-            // Firmware switch to SuperOS over DIN (web editor's Switch button).
-            while (s_save_pending) patt_save_step();
-            combined_switch_firmware(FW_SUPEROS);  // does not return
-#endif
-          }
+        break;
+
+    case 0x46:
+        if (s_din_sx_len == 1 &&
+            s_din_patt_buf[0] < PATT_BLK_N) {
+            din_send_pattern_block(
+                s_din_patt_buf[0]
+            );
         }
-        s_sxq = 0;      // any byte after the command ends this short-query walk
-      }
-    }
+        break;
+
+    case 0x47:
+        if (s_din_sx_len ==
+            (uint16_t)(1 + PATT_WIRE_LEN)) {
+            const uint8_t blk =
+                s_din_patt_buf[0];
+
+            din_write_pattern_block(
+                blk,
+                s_din_patt_buf + 1,
+                PATT_WIRE_LEN
+            );
+        } else {
+            const uint8_t blk =
+                s_din_sx_len > 0
+                    ? s_din_patt_buf[0]
+                    : 0x7F;
+
+            din_send_pattern_ack(blk, 1);
+        }
+        break;
+
+    case 0x4A:
+        if (s_din_sx_len == 0)
+            enter_bootloader();
+        break;
+
+#ifdef SUPEROS_COMBINED
+
+    case 0x4D:
+        if (s_din_sx_len == 0) {
+            while (s_save_pending)
+                patt_save_step();
+
+            combined_switch_firmware(FW_SUPEROS);
+        }
+        break;
+
 #endif
-    if (b >= 0xF8) {                          // realtime (may interleave)
-      // Transport only when MIDI is the selected source: a stray Start in DIN
-      // mode would force the RUN line and wait for pulses that never come.
-      if (b == 0xF8) emu_sync_ext_pulse(&g_sync, EMU_CLK_MIDI);
-      else if (b == 0xFA && g_set.clock_source == EMU_CLK_MIDI) { emu_sync_transport(&g_sync, 1); }
-      else if (b == 0xFC && g_set.clock_source == EMU_CLK_MIDI) { emu_sync_transport(&g_sync, 0); emu_notes_out_all_off(&g_out); }
-      continue;
+
+    default:
+        break;
     }
-    // Status. System common (0xF0-0xF7, incl. SysEx) clears running status so
-    // its data bytes below are ignored instead of misparsed as channel messages.
-    if (b & 0x80) { s_status = (b < 0xF0) ? b : 0; s_have_d1 = false; continue; }
-    if (!s_status) continue;                                      // data inside SysEx etc.
-    if (!s_have_d1) { s_d1 = b; s_have_d1 = true; }               // data1
-    else {                                                        // data2 -> complete
-      midi_handle_channel(s_status, s_d1, b); s_have_d1 = false;
+}
+
+static bool din_d650_sysex_feed(uint8_t b) {
+    if (b >= 0xF8)
+        return false;
+
+    if (b == 0xF0) {
+        s_din_sx_state = DIN_SYSEX_WAIT_VENDOR;
+        s_din_sx_cmd = 0;
+        s_din_sx_len = 0;
+        s_din_sx_overflow = false;
+        return true;
     }
-  }
+
+    if (s_din_sx_state == DIN_SYSEX_IDLE)
+        return false;
+
+    switch (s_din_sx_state) {
+    case DIN_SYSEX_WAIT_VENDOR:
+        if (b == 0x7D) {
+            s_din_sx_state =
+                DIN_SYSEX_WAIT_COMMAND;
+        } else {
+            s_din_sx_state = DIN_SYSEX_IDLE;
+        }
+
+        return true;
+
+    case DIN_SYSEX_WAIT_COMMAND:
+        if (b == 0xF7) {
+            s_din_sx_state = DIN_SYSEX_IDLE;
+            return true;
+        }
+
+        if (b & 0x80) {
+            s_din_sx_state = DIN_SYSEX_IDLE;
+            return true;
+        }
+
+        s_din_sx_cmd = b;
+        s_din_sx_state = DIN_SYSEX_PAYLOAD;
+        return true;
+
+    case DIN_SYSEX_PAYLOAD:
+        if (b == 0xF7) {
+            if (!s_din_sx_overflow)
+                din_handle_d650_sysex();
+
+            s_din_sx_state = DIN_SYSEX_IDLE;
+            s_din_sx_cmd = 0;
+            s_din_sx_len = 0;
+            s_din_sx_overflow = false;
+            return true;
+        }
+
+        if (b & 0x80) {
+            s_din_sx_state = DIN_SYSEX_IDLE;
+            s_din_sx_cmd = 0;
+            s_din_sx_len = 0;
+            s_din_sx_overflow = false;
+            return true;
+        }
+
+        if (s_din_sx_len <
+            sizeof(s_din_patt_buf)) {
+            s_din_patt_buf[
+                s_din_sx_len++
+            ] = b;
+        } else {
+            s_din_sx_overflow = true;
+        }
+
+        return true;
+
+    default:
+        s_din_sx_state = DIN_SYSEX_IDLE;
+        return false;
+    }
+}
+
+#endif
+
+static void midi_in_poll() {
+    while (Serial1.available()) {
+        const uint8_t b =
+            (uint8_t)Serial1.read();
+
+#ifdef D650_ROM_IN_RAM
+
+        rom_rx_feed(b);
+
+        if (din_d650_sysex_feed(b))
+            continue;
+
+#endif
+
+        if (b >= 0xF8) {
+            if (b == 0xF8) {
+                emu_sync_ext_pulse(
+                    &g_sync,
+                    EMU_CLK_MIDI
+                );
+            }
+            else if (
+                b == 0xFA &&
+                g_set.clock_source ==
+                    EMU_CLK_MIDI
+            ) {
+                emu_sync_transport(
+                    &g_sync,
+                    1
+                );
+            }
+            else if (
+                b == 0xFC &&
+                g_set.clock_source ==
+                    EMU_CLK_MIDI
+            ) {
+                emu_sync_transport(
+                    &g_sync,
+                    0
+                );
+
+                emu_notes_out_all_off(
+                    &g_out
+                );
+            }
+
+            continue;
+        }
+
+        if (b & 0x80) {
+            s_status =
+                (b < 0xF0) ? b : 0;
+
+            s_have_d1 = false;
+            continue;
+        }
+
+        if (!s_status)
+            continue;
+
+        if (!s_have_d1) {
+            s_d1 = b;
+            s_have_d1 = true;
+        } else {
+            midi_handle_channel(
+                s_status,
+                s_d1,
+                b
+            );
+
+            s_have_d1 = false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -884,7 +1194,14 @@ static void usb_sysex_msg(const uint8_t *data, unsigned int sz) {
     if (n >= 3 + PATT_WIRE_LEN && p[2] < PATT_BLK_N) {
       const uint8_t blk = p[2];
       uint8_t *dst = &H.ext[(uint16_t)blk * PATT_BLK_LEN];
-      unpack7(p + 3, PATT_WIRE_LEN, dst);
+      if (!unpack7_checked(
+        p + 3,
+        PATT_WIRE_LEN,
+        dst,
+        PATT_BLK_LEN)) {
+          usb_ram_ack(p[2], 1);
+          break;
+        }
 #ifdef SUPEROS_COMBINED
       // Blocking update of just this block (changed bytes only). Web editing
       // happens stopped; worst case (all 192 bytes differ) is ~630 ms.
