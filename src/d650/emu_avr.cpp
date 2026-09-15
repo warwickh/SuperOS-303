@@ -325,6 +325,7 @@ static void din_send_pattern_ack(uint8_t blk,
     midi_tx(status);
     midi_tx(0xF7);
 }
+#endif  
 
 static void din_write_pattern_block(uint8_t blk,
                                     const uint8_t *packed,
