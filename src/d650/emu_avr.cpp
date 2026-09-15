@@ -155,6 +155,30 @@ static const uint8_t PATT_BLK_N = D650_EXT_BYTES / PATT_BLK_LEN;   // 8
 static_assert(PATT_BLK_N * (uint16_t)PATT_BLK_LEN <= D650_EXT_BYTES,
               "pattern block writes run past the uPD444 store");
 
+// 7-bit pack/unpack (SuperOS midi.cpp scheme): each group of up to 7 raw bytes
+// goes out as 1 MSB-bitmap byte + 7 low-7-bit bytes. 192 raw -> 220 wire bytes.
+static const uint16_t PATT_WIRE_LEN = 220;
+static uint16_t pack7(const uint8_t *src, uint16_t len, uint8_t *out) {
+  uint16_t o = 0;
+  for (uint16_t i = 0; i < len; i += 7) {
+    uint8_t msb = 0;
+    const uint8_t n = (len - i >= 7) ? 7 : (uint8_t)(len - i);
+    for (uint8_t b = 0; b < n; ++b)
+      if (src[i + b] & 0x80) msb |= (uint8_t)(1u << b);
+    out[o++] = msb;
+    for (uint8_t b = 0; b < n; ++b) out[o++] = src[i + b] & 0x7F;
+  }
+  return o;
+}
+static void unpack7(const uint8_t *src, uint16_t wire_len, uint8_t *out) {
+  uint16_t i = 0, o = 0;
+  while (i < wire_len) {
+    const uint8_t msb = src[i++];
+    for (uint8_t b = 0; b < 7 && i < wire_len; ++b)
+      out[o++] = (uint8_t)(src[i++] | ((msb >> b) & 1 ? 0x80 : 0));
+  }
+}
+
 // Deferred incremental pattern save (see loop). flash_write_page halts the
 // CPU ~9 ms/page, and when the append bank fills, FlashEeprom's GC reprograms
 // EVERY live record page in one write() call: 100 ms .. ~1 s of CPU halt.
@@ -770,29 +794,6 @@ static void usb_send_status() {
   for (uint8_t i = 0; i < g_status_pad; i++) r[n + i] = 0;
   n = (uint8_t)(n + g_status_pad);
   if (usb_sof_alive()) usbMIDI.sendSysEx(n, r, false);   // core wraps F0 .. F7
-}
-// 7-bit pack/unpack (SuperOS midi.cpp scheme): each group of up to 7 raw bytes
-// goes out as 1 MSB-bitmap byte + 7 low-7-bit bytes. 192 raw -> 220 wire bytes.
-static const uint16_t PATT_WIRE_LEN = 220;
-static uint16_t pack7(const uint8_t *src, uint16_t len, uint8_t *out) {
-  uint16_t o = 0;
-  for (uint16_t i = 0; i < len; i += 7) {
-    uint8_t msb = 0;
-    const uint8_t n = (len - i >= 7) ? 7 : (uint8_t)(len - i);
-    for (uint8_t b = 0; b < n; ++b)
-      if (src[i + b] & 0x80) msb |= (uint8_t)(1u << b);
-    out[o++] = msb;
-    for (uint8_t b = 0; b < n; ++b) out[o++] = src[i + b] & 0x7F;
-  }
-  return o;
-}
-static void unpack7(const uint8_t *src, uint16_t wire_len, uint8_t *out) {
-  uint16_t i = 0, o = 0;
-  while (i < wire_len) {
-    const uint8_t msb = src[i++];
-    for (uint8_t b = 0; b < 7 && i < wire_len; ++b)
-      out[o++] = (uint8_t)(src[i++] | ((msb >> b) & 1 ? 0x80 : 0));
-  }
 }
 static void usb_send_ram_block(uint8_t blk) {
   uint8_t r[3 + PATT_WIRE_LEN];
