@@ -39,6 +39,7 @@
 
 #pragma once
 #include <Arduino.h>
+#include <stddef.h>   // offsetof, for the PATTERN_LEN_OFF assert
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(a[0]))
 #define CONSTRAIN(x, lb, ub) do { if (x < (lb)) x = lb; else if (x > (ub)) x = ub; } while (0)
@@ -61,6 +62,10 @@ static inline uint8_t fast_rand(uint8_t n) {
 // pages (see flash_persist.h). At 64 steps the same set needs 127+ pages and
 // ~33 KB of payload against 26.8 KB physical -- it cannot fit.
 static constexpr int MAX_STEPS = 32;
+// Byte offset of `length` inside the persisted pattern blob. NOT PATTERN_SIZE-1:
+// ratchet[8] is appended AFTER length (2026-08-31), so the last blob byte is a
+// ratchet byte, not the length.
+static constexpr int PATTERN_LEN_OFF = MAX_STEPS + (MAX_STEPS / 4) + 11;
 // Triplet mode replaces 16-step pages with 12-step pages (spec 7): the same
 // pages, so the length ceiling is 2 * 12 = 24 rather than 2 * 16 = 32.
 static constexpr int STEPS_PER_PAGE         = 16;
@@ -614,6 +619,9 @@ struct Sequence {
     return true;
   }
 };
+
+static_assert(offsetof(Sequence, length) == PATTERN_LEN_OFF,
+              "PATTERN_LEN_OFF must track Sequence::length");
 
 // =============================================================================
 // Free helpers

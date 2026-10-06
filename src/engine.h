@@ -220,7 +220,7 @@ struct Engine {
     if (valid) {
       load_group_patterns();
       GlobalSettings.load_midi_from_storage();
-      direction_ = DIR_FORWARD;
+      adopt_pattern_direction();
     } else {
       // Signature mismatch (fresh flash or a block-map change): wipe the whole
       // arena so no stale records from an old layout survive at reused block ids.
@@ -390,7 +390,7 @@ struct Engine {
     if ((pat & uint8_t(NUM_PATTERNS - 1)) != p_select) return false;
     Sequence &sh = shadow_[var - 1];
     memcpy(sh.pitch, raw, PATTERN_SIZE);     // pitch[]+time_data[]+meta, length at end
-    uint8_t L = raw[PATTERN_SIZE - 1];
+    uint8_t L = raw[PATTERN_LEN_OFF];
     sh.length = (L >= 1 && L <= MAX_STEPS) ? L : 8;
     sequence_rebuild_pitch_count(sh);
     normalize_pattern_times(sh);
@@ -447,7 +447,7 @@ struct Engine {
         (shadow_edit_slot_ != int16_t(slot) || shadow_edit_var_ != var))
       flush_shadow_edit();
     deserialize_pattern(shadow_edit_, raw);
-    shadow_edit_.length = raw[PATTERN_SIZE - 1];
+    shadow_edit_.length = raw[PATTERN_LEN_OFF];
     sequence_rebuild_pitch_count(shadow_edit_);
     normalize_pattern_times(shadow_edit_);
     shadow_edit_slot_  = int16_t(slot);
@@ -884,8 +884,7 @@ struct Engine {
         if (next_p != p_select) {
           p_select = next_p;
           get_sequence().Reset();
-          direction_change_pending_ = false;
-          pp_dir_ = 1; advance_count_ = 0;
+          adopt_pattern_direction();   // the incoming pattern's own direction
           result = get_sequence().Advance();
           step_dir = next_step_dir = 1;
         }
@@ -932,9 +931,7 @@ struct Engine {
         if (next_p != p_select) {
           p_select = next_p;
           get_sequence().Reset();
-          advance_count_ = 0;
-          direction_change_pending_ = false;
-          pp_dir_ = 1;
+          adopt_pattern_direction();   // the incoming pattern's own direction
         }
       }
     }
@@ -1473,6 +1470,23 @@ struct Engine {
     }
   }
 
+  // Load the SELECTED pattern's stored direction (reserved[0] bits[2:0]) into
+  // the live engine. Direction has been per-pattern data since the multitimbral
+  // work, and both writers store it (the editor in the 0x12 blob, Pattern Write
+  // via store_direction), but NOTHING read it back: p_select changed and the
+  // engine kept whatever direction was last set, and Load() forced FORWARD at
+  // boot. So a stored direction only ever took effect when the editor happened
+  // to push the pattern the engine already had selected -- which is why the
+  // web editor's Fwd/Rev/Rnd looked dead while the config write (0x22, which
+  // sets the engine directly) looked like it worked. Called at every p_select
+  // write and at Load.
+  void adopt_pattern_direction() {
+    direction_ = SequenceDirection(pattern[p_select].get_direction_stored());
+    direction_change_pending_ = false;
+    pp_dir_ = 1;
+    advance_count_ = 0;
+  }
+
   void ClearPattern(uint8_t idx) {
     pattern[idx].Clear();
     stale = true;
@@ -1628,7 +1642,7 @@ struct Engine {
   // ---------------------------------------------------------------------------
   void SetPattern(uint8_t p_, bool override = false) {
     next_p = p_ & 0xf;
-    if (override) p_select = next_p;
+    if (override) { p_select = next_p; adopt_pattern_direction(); }
     edit_var_ = 0; // a new pattern always starts on variation 1 for editing
   }
   // Canonical length change: clamps to the triplet cap (TRIPLET_MAX_STEPS, 24
@@ -1725,7 +1739,7 @@ struct Engine {
 
   bool import_pattern_blob(uint8_t idx, const uint8_t *blob, bool persist_eeprom = true) {
     idx &= 0xf;
-    uint8_t L = blob[PATTERN_SIZE - 1];
+    uint8_t L = blob[PATTERN_LEN_OFF];
     if (L < 1 || uint8_t(L) > MAX_STEPS) return false;
     const uint8_t gmax = MAX_STEPS;
     if (L > gmax) L = gmax;
