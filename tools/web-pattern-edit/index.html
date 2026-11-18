@@ -1180,6 +1180,7 @@
   var RAT_BYTES      = MAX_STEPS / 4;
   var PATTERN_SIZE   = RAT_OFF + RAT_BYTES;    // 60
   var PACKED_SIZE    = PATTERN_SIZE + Math.ceil(PATTERN_SIZE / 7); // 69
+  
   // Per-step ratchet accessors (mirror Sequence::ratchet_of/set_ratchet_of).
   function patternRatchet(blob, step) {
     var i = step & (MAX_STEPS - 1);
@@ -1190,41 +1191,54 @@
     blob[RAT_OFF + (i >> 2)] =
         (blob[RAT_OFF + (i >> 2)] & ~(0x03 << sh)) | ((count & 0x03) << sh);
   }
-// Push all 16 variation-1 patterns for the group currently loaded on the 303.
-// Used after multi-pattern JSON imports. sendPattern() is called directly so
-// changing activePat cannot accidentally sync the rendered grid into another slot.
-function pushCurrentGroupNow() {
+function pushLoadedPatternsNow(loadedPatterns) {
   if (!midiOut) {
-    log('JSON group push skipped: connect MIDI output to sync to the 303', 'log-err');
+    log('JSON push skipped: no MIDI output connected', 'log-err');
     return;
   }
 
   if (hwGroup < 0 || hwGroup >= NUM_GROUPS) {
-    log('JSON group push skipped: hardware group is not known yet', 'log-err');
+    log('JSON push skipped: hardware group is not known', 'log-err');
     return;
   }
 
   var g = hwGroup;
 
+  // Only entries loaded for the group currently resident in the 303.
+  var matching = loadedPatterns.filter(function(pd) {
+    return (pd.group - 1) === g;
+  });
+
+  if (!matching.length) {
+    log(
+      'JSON loaded no patterns for hardware Group ' + (g + 1) +
+      '; nothing pushed',
+      'log-syx'
+    );
+    return;
+  }
+
   log(
-    'JSON sync: pushing Group ' + (g + 1) +
-    ' (16 patterns) to 303',
+    'JSON sync: pushing ' + matching.length +
+    ' loaded pattern(s) from Group ' + (g + 1),
     'log-syx'
   );
 
-  for (var p = 0; p < PATS_PER_GROUP; p++) {
+  matching.forEach(function(pd) {
+    var p = pd.pattern - 1;
     var blob = cvBlob(g, p);
 
     log(
       'JSON sync: push G' + (g + 1) +
       '\u00b7P' + (p + 1) +
-      ' (variation 1, ' + getLength(blob) + ' steps)',
+      ' (' + getLength(blob) + ' steps)',
       'log-syx'
     );
 
     sendPattern(p, blob, VAR_303);
-  }
+  });
 
+  // Reset/refresh incremental-send baseline.
   if (activeGroup === g) {
     lastSentBlob = new Uint8Array(cvBlob(g, activePat));
     lastSentPat = activePat;
@@ -1234,11 +1248,12 @@ function pushCurrentGroupNow() {
   }
 
   log(
-    'JSON sync queued: Group ' + (g + 1) +
-    ' (16/16 patterns)',
+    'JSON sync queued: ' + matching.length +
+    ' loaded pattern(s) from Group ' + (g + 1),
     'log-ack'
   );
 }
+
   // Variation-3 poly blob (matches firmware poly.h, chord-list model). A CHORD STREAM
   // (notes pack 4x6 bits = 3 bytes/chord, accent/slide per chord) plus an independent
   // per-step TIME stream; the K-th NOTE step pulls chord K. 115 raw -> 132 packed.
@@ -5505,7 +5520,7 @@ function pushCurrentGroupNow() {
                                     single ? activePat  : undefined);
         log('Loaded ' + obj.data.length + ' pattern(s) from JSON (' + obj.type + ', saved ' + (obj.saved_at || 'unknown') + ')' +
             (single ? ' into group ' + (activeGroup+1) + ' pattern ' + (activePat+1) : ''), 'log-syx');
-        if (liveEnabled && midiOut) pushCurrentGroupNow();
+        if (liveEnabled && midiOut) pushLoadedPatternsNow(obj.data);
         if (single) {
           document.getElementById('patLen').value = String(getLength(activeBlob()));
           pushFullPatternNow();

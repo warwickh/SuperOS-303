@@ -1,0 +1,84 @@
+diff --git a/tools/web-pattern-edit/index.html b/tools/web-pattern-edit/index.html
+index 57232f2..24c2aa3 100644
+--- a/tools/web-pattern-edit/index.html
++++ b/tools/web-pattern-edit/index.html
+@@ -577,7 +577,7 @@
+        connection, the D650C backup strip, the Library, and Device Config. ── */
+     #d650Strip { display: none; }
+     body.mode-d650 #d650Strip { display: flex; }
+-    body.mode-d650 .app > :not(.header):not(#midiStrip):not(#d650Strip):not(#romStrip):not(#libPanel):not(#configPanel):not(#d650Banner):not(#httpBanner):not(#syncOverlay):not(#downloadToast):not(#errorToast):not(.log-panel) { display: none; }
++    body.mode-d650 .app > :not(.header):not(#midiStrip):not(#d650Strip):not(#romStrip):not(#libPanel):not(#configPanel):not(#d650Banner):not(#httpBanner):not(#syncOverlay):not(#downloadToast):not(#errorToast) { display: none; }
+     body.mode-d650 #cfgSuperos { display: none; }
+     body.mode-d650 #cfgD650 { display: flex !important; }
+   </style>
+@@ -1190,7 +1190,55 @@
+     blob[RAT_OFF + (i >> 2)] =
+         (blob[RAT_OFF + (i >> 2)] & ~(0x03 << sh)) | ((count & 0x03) << sh);
+   }
++// Push all 16 variation-1 patterns for the group currently loaded on the 303.
++// Used after multi-pattern JSON imports. sendPattern() is called directly so
++// changing activePat cannot accidentally sync the rendered grid into another slot.
++function pushCurrentGroupNow() {
++  if (!midiOut) {
++    log('JSON group push skipped: connect MIDI output to sync to the 303', 'log-err');
++    return;
++  }
++
++  if (hwGroup < 0 || hwGroup >= NUM_GROUPS) {
++    log('JSON group push skipped: hardware group is not known yet', 'log-err');
++    return;
++  }
++
++  var g = hwGroup;
++
++  log(
++    'JSON sync: pushing Group ' + (g + 1) +
++    ' (16 patterns) to 303',
++    'log-syx'
++  );
++
++  for (var p = 0; p < PATS_PER_GROUP; p++) {
++    var blob = cvBlob(g, p);
++
++    log(
++      'JSON sync: push G' + (g + 1) +
++      '\u00b7P' + (p + 1) +
++      ' (variation 1, ' + getLength(blob) + ' steps)',
++      'log-syx'
++    );
++
++    sendPattern(p, blob, VAR_303);
++  }
++
++  if (activeGroup === g) {
++    lastSentBlob = new Uint8Array(cvBlob(g, activePat));
++    lastSentPat = activePat;
++  } else {
++    lastSentBlob = null;
++    lastSentPat = -1;
++  }
+ 
++  log(
++    'JSON sync queued: Group ' + (g + 1) +
++    ' (16/16 patterns)',
++    'log-ack'
++  );
++}
+   // Variation-3 poly blob (matches firmware poly.h, chord-list model). A CHORD STREAM
+   // (notes pack 4x6 bits = 3 bytes/chord, accent/slide per chord) plus an independent
+   // per-step TIME stream; the K-th NOTE step pulls chord K. 115 raw -> 132 packed.
+@@ -5457,6 +5505,7 @@
+                                     single ? activePat  : undefined);
+         log('Loaded ' + obj.data.length + ' pattern(s) from JSON (' + obj.type + ', saved ' + (obj.saved_at || 'unknown') + ')' +
+             (single ? ' into group ' + (activeGroup+1) + ' pattern ' + (activePat+1) : ''), 'log-syx');
++        if (liveEnabled && midiOut) pushCurrentGroupNow();
+         if (single) {
+           document.getElementById('patLen').value = String(getLength(activeBlob()));
+           pushFullPatternNow();
+@@ -7594,4 +7643,4 @@
+ })();
+ </script>
+ </body>
+-</html>
++</html>
+\ No newline at end of file
